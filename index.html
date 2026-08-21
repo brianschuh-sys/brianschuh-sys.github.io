@@ -622,24 +622,51 @@
     if(ballZone === 'outside'){
       // Ball is beyond the top of the box - nobody responds to it. Everyone stays home.
     } else if(ballZone === 'behind'){
-      // Ball is below GLE (behind the goal).
+      // ROTATION: as the ball approaches GLE from behind the goal, the defense rotates
+      // so that by the moment it crosses (y=0) everyone is already in the "engaging at
+      // the bottom of the paint" configuration - not after.
       const side = ball.x < 0 ? 'L' : 'R';
-      const key = side === 'L' ? 'BL' : 'BR';
-      const zoneMates = offense.filter((o,i) => i !== ballIndex && zoneOf(o) === key);
-      if(zoneMates.length > 0){
-        // Ball-side bottom defender plays parallel with the nearest off-ball attacker in his zone.
-        let best = null, bestScore = Infinity;
-        zoneMates.forEach(o=>{
-          const score = Math.abs(o.y) + Math.abs(o.x);
-          if(score < bestScore){ bestScore = score; best = o; }
-        });
-        targets[key] = clampToZone({ x: homes[key].x, y: best.y }, key);
-        engaged[key] = true;
+      const ROTATE_DEPTH = 3; // yards behind GLE over which the rotation plays out
+      const t = clamp((ball.y + ROTATE_DEPTH) / ROTATE_DEPTH, 0, 1); // 0 = deep behind, 1 = at GLE
+      const ballSideBottom = side === 'L' ? 'BL' : 'BR';
+      const oppBottom      = side === 'L' ? 'BR' : 'BL';
+      const ballSideTop     = side === 'L' ? 'TL' : 'TR';
+      const oppTop          = side === 'L' ? 'TR' : 'TL';
+
+      // Ball-side bottom defender: stays on the off-ball attacker in his zone the whole time.
+      {
+        const zoneMates = offense.filter((o,i) => i !== ballIndex && zoneOf(o) === ballSideBottom);
+        if(zoneMates.length > 0){
+          let best = null, bestScore = Infinity;
+          zoneMates.forEach(o=>{
+            const score = Math.abs(o.y) + Math.abs(o.x);
+            if(score < bestScore){ bestScore = score; best = o; }
+          });
+          targets[ballSideBottom] = clampToZone({ x: homes[ballSideBottom].x, y: best.y }, ballSideBottom);
+          engaged[ballSideBottom] = true;
+        }
       }
-      // else: no man in his zone -> he simply stays home (default already set).
-      // Top defenders pinch to the corners of the inner box while the ball is behind the goal.
-      targets.TL = innerCorners.TL;
-      targets.TR = innerCorners.TR;
+      // Opposite bottom defender: rotates over from his home corner toward bottom-center
+      // of the paint, looking to engage the ball carrier there.
+      {
+        const homeX = homes[oppBottom].x;
+        const p = lerp({x:homeX, y:PAINT.yNear}, {x:0, y:PAINT.yNear}, t);
+        targets[oppBottom] = clampToZone(p, oppBottom);
+        engaged[oppBottom] = t > 0.02;
+      }
+      // Ball-side top defender: rotates in sync, from his inner-box corner over to where
+      // the TL/TR split line meets the top of the inner box.
+      {
+        const p = lerp(innerCorners[ballSideTop], {x:0, y:INNER_BOX.yFar}, t);
+        targets[ballSideTop] = clampToZone(p, ballSideTop);
+      }
+      // Opposite top defender: rotates in sync, down from his inner-box corner to where
+      // the top/bottom split line meets his side of the inner box.
+      {
+        const ownSideX = oppTop === 'TR' ? INNER_BOX.xHalf : -INNER_BOX.xHalf;
+        const p = lerp(innerCorners[oppTop], {x:ownSideX, y:paintMidY}, t);
+        targets[oppTop] = clampToZone(p, oppTop);
+      }
     } else if(inTopCenter && !multiplePaint){
       // Top-center lane is the inside defender's alone - all 4 outer defenders pinch
       // to the corners of the inner box.
