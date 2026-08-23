@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Box and 1 - Defense Trainer</title>
+<link rel="stylesheet" href="shared/style.css">
+</head>
+<body>
+
+<div class="app-minimal">
+  <div class="field-card">
+    <div class="field-title-row">
+      <a href="index.html" class="back-link">&larr; All Defenses</a>
+      <span class="scheme-label">Box and 1</span>
+      <span></span>
+    </div>
+    <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
+    <p class="hint">Drag any dot to move it. Click (don't drag) an orange dot to give it the ball. Carry the ball around behind the goal and up into the bottom zone to trigger the rotation, or pass to the opposite low man from within 1 yard of GLE to beat the slide.</p>
+    <div class="minimal-controls">
+      <button class="ctl" id="resetBtn">Reset Defense</button>
+    </div>
+  </div>
+</div>
+
+<script src="shared/defense-engine.js"></script>
+<script>
+(function(){
+  const h = DefenseEngine.helpers;
+  const { PAINT, INNER_BOX, paintMidY, GOAL, FIELD_X } = h;
+
+  // ---------------- box-and-1 geometry ----------------
+  // The "fan": 15 yd from goal, +/-60 deg off dead-center.
+  const FAN_R = 15;
+  const FAN_HALF_ANGLE = Math.PI/3; // 60 deg
+  function fanClamp(pt){
+    const dx = pt.x-GOAL.x, dy = pt.y-GOAL.y;
+    const r = Math.hypot(dx,dy);
+    if(r < 0.0001) return {x:GOAL.x, y:GOAL.y};
+    let angle = Math.atan2(dx, dy);
+    angle = h.clamp(angle, -FAN_HALF_ANGLE, FAN_HALF_ANGLE);
+    const rc = Math.min(r, FAN_R);
+    return { x: GOAL.x + rc*Math.sin(angle), y: GOAL.y + rc*Math.cos(angle) };
+  }
+
+  const BOX_TOP = 20; // the "top of box" boundary line - the offensive box's far edge
+  const TOP_CENTER = { xHalf: INNER_BOX.xHalf, yNear: PAINT.yFar, yFar: BOX_TOP };
+
+  // Each zone defender is hard-confined to their own rectangle.
+  const ZONE_BOUNDS = {
+    TL: { xMin:FIELD_X[0], xMax:0, yMin:paintMidY, yMax:FAN_R },
+    TR: { xMin:0, xMax:FIELD_X[1], yMin:paintMidY, yMax:FAN_R },
+    BL: { xMin:FIELD_X[0], xMax:0, yMin:PAINT.yNear, yMax:paintMidY },
+    BR: { xMin:0, xMax:FIELD_X[1], yMin:PAINT.yNear, yMax:paintMidY }
+  };
+  function clampToZone(pos, key){
+    const z = ZONE_BOUNDS[key];
+    return { x: h.clamp(pos.x, z.xMin, z.xMax), y: h.clamp(pos.y, z.yMin, z.yMax) };
+  }
+
+  // Which quadrant of the whole offensive box a point falls in.
+  function zoneOf(pt){
+    if(pt.y > BOX_TOP) return 'outside';
+    if(pt.y < 0) return 'behind';
+    return (pt.y >= paintMidY) ? (pt.x < 0 ? 'TL' : 'TR') : (pt.x < 0 ? 'BL' : 'BR');
+  }
+
+  const DIAGONAL = { TL:'BR', TR:'BL', BL:'TR', BR:'TL' };
+
+  // ---------------- permanent rotation state ----------------
+  // defenderRoles[i] = which zone role (TL/TR/BL/BR) defender token i currently plays.
+  // Token identity (index, and therefore color) never changes - only its assignment does.
+  let defenderRoles = ['TL', 'TR', 'BL', 'BR'];
+  let prevBallZone = null;     // last zoneOf(ball), for edge-detecting zone transitions
+  let rotationPending = false; // true while there's a live wrap threat (ball behind the
+                                // goal, or just carried across) that hasn't rotated yet
+  // Pass trigger window: the carrier has to be below GLE (behind the goal) and within
+  // 1 yard of it - i.e. y in [-1, 0]. The carry-it-in trigger has no such limit; it
+  // fires the instant the carrier, dragged, actually arrives in the bottom zone.
+  const PASS_TRIGGER_MAX_DIST = 1;
+
+  function resetRotationState(offense, ballIndex){
+    defenderRoles = ['TL', 'TR', 'BL', 'BR'];
+    rotationPending = false;
+    prevBallZone = offense[ballIndex] ? zoneOf(offense[ballIndex]) : null;
+  }
+
+  // The one rotation rule, applied as a 4-cycle around the box:
+  //   slide (opposite bottom) -> takes over ball-side bottom
+  //   ball-side bottom (stayed home) -> becomes ball-side top
+  //   ball-side top -> becomes opposite top
+  //   opposite top -> drops to fill the vacated opposite bottom
+  // This redefines each defender's permanent home zone, so it keeps chaining on
+  // every subsequent crossing - it never resets back to the original TL/TR/BL/BR base.
+  function applyRotation(side){
+    const ballSideBottom = side === 'L' ? 'BL' : 'BR';
+    const oppBottom      = side === 'L' ? 'BR' : 'BL';
+    const ballSideTop    = side === 'L' ? 'TL' : 'TR';
+    const oppTop         = side === 'L' ? 'TR' : 'TL';
+    const nextRole = {};
+    nextRole[oppBottom]      = ballSideBottom;
+    nextRole[ballSideBottom] = ballSideTop;
+    nextRole[ballSideTop]    = oppTop;
+    nextRole[oppTop]         = oppBottom;
+    defenderRoles = defenderRoles.map(r => nextRole[r] || r);
+    rotationPending = false;
+  }
+
+  // Trigger 1 (live, automatic - no click needed): called every render. The moment a
+  // carrier being dragged actually arrives in the ball-side bottom zone, the slide has
+  // engaged him and the rotation fires immediately, mid-drag.
+  function evaluateLiveRotation(offense, ballIndex){
+    const newBallZone = zoneOf(offense[ballIndex]);
+
+    if(newBallZone === 'behind'){
+      rotationPending = true;
+    } else if(newBallZone === 'outside'){
+      rotationPending = false; // play moved away - this wrap threat is abandoned
+    }
+
+    if(rotationPending){
+      const side = offense[ballIndex].x < 0 ? 'L' : 'R';
+      const ballSideBottom = side === 'L' ? 'BL' : 'BR';
+      if(newBallZone === ballSideBottom && prevBallZone !== ballSideBottom){
+        applyRotation(side);
+      }
+    }
+
+    prevBallZone = newBallZone;
+  }
+
+  // Trigger 2 (pass): fires the SAME rotation when the carrier - below GLE, within 1
+  // yard of it - skips the ball to the off-ball attacker sitting in the opposite
+  // bottom zone, beating the slide before it ever engages him directly.
+  function maybeFirePassRotation(receiverIdx, offense, ballIndex){
+    if(!rotationPending) return false;
+    const carrier = offense[ballIndex];
+    if(carrier.y > 0 || carrier.y < -PASS_TRIGGER_MAX_DIST) return false;
+    const side = carrier.x < 0 ? 'L' : 'R';
+    const oppBottom = side === 'L' ? 'BR' : 'BL';
+    if(zoneOf(offense[receiverIdx]) === oppBottom){
+      applyRotation(side);
+      return true;
+    }
+    return false;
+  }
+
+  // ---------------- zone computation ----------------
+  const BOX_AND_ONE_COLORS = ['#8e44ad', '#16a085', '#2980b9', '#e91e8c', '#f1c40f']; // TL, TR, BL, BR, Inside
+
+  function computeBoxAndOne(offense, ballIndex){
+    const ball = offense[ballIndex];
+    const homes = {
+      TL: {x:-PAINT.xHalf, y:PAINT.yFar},
+      TR: {x: PAINT.xHalf, y:PAINT.yFar},
+      BL: {x:-PAINT.xHalf, y:PAINT.yNear},
+      BR: {x: PAINT.xHalf, y:PAINT.yNear}
+    };
+    const innerCorners = {
+      TL: {x:-INNER_BOX.xHalf, y:INNER_BOX.yFar},
+      TR: {x: INNER_BOX.xHalf, y:INNER_BOX.yFar},
+      BL: {x:-INNER_BOX.xHalf, y:INNER_BOX.yNear},
+      BR: {x: INNER_BOX.xHalf, y:INNER_BOX.yNear}
+    };
+    // Default: everyone sits home unless a rule below says otherwise.
+    const targets = { TL:homes.TL, TR:homes.TR, BL:homes.BL, BR:homes.BR };
+    const engaged = { TL:false, TR:false, BL:false, BR:false };
+
+    const occupants = offense.filter(o => h.inPaint(o));
+    const multiplePaint = occupants.length > 1;
+    const inTopCenter = Math.abs(ball.x) <= TOP_CENTER.xHalf && ball.y > TOP_CENTER.yNear && ball.y <= TOP_CENTER.yFar;
+    const ballZone = zoneOf(ball);
+
+    if(ballZone === 'outside'){
+      // Ball is beyond the top of the box - nobody responds to it. Everyone stays home.
+    } else if(ballZone === 'behind'){
+      // ROTATION: as the ball approaches GLE from behind the goal, the defense rotates
+      // so that by the moment it crosses (y=0) everyone is already in the "engaging at
+      // the bottom of the paint" configuration - not after.
+      const side = ball.x < 0 ? 'L' : 'R';
+      const ROTATE_DEPTH = 3; // yards behind GLE over which the rotation plays out
+      const t = h.clamp((ball.y + ROTATE_DEPTH) / ROTATE_DEPTH, 0, 1); // 0 = deep behind, 1 = at GLE
+      const ballSideBottom = side === 'L' ? 'BL' : 'BR';
+      const oppBottom      = side === 'L' ? 'BR' : 'BL';
+      const ballSideTop     = side === 'L' ? 'TL' : 'TR';
+      const oppTop          = side === 'L' ? 'TR' : 'TL';
+
+      // Ball-side bottom defender: stays on the off-ball attacker on his side of the
+      // field who is above GLE, mirroring their depth. Restricted to y >= 0 (above
+      // GLE) - only counting attackers actually in front of the goal, not anyone else
+      // who might also be behind it - and picks whichever qualifying attacker sits
+      // lowest (closest to the goal), since that's the one actually in the low zone.
+      // Picking by lowest y instead of overall distance-to-origin is what fixes the
+      // "sometimes mirrors the wrong guy" glitch: with a wing player and a low
+      // attackman both on the same side, a combined x+y distance score can flip
+      // between them depending on how wide the wing player is standing, even though
+      // the low attackman is always the correct one to mirror.
+      {
+        const zoneMates = offense.filter((o,i) => i !== ballIndex && o.y >= 0 && (side === 'L' ? o.x < 0 : o.x >= 0));
+        if(zoneMates.length > 0){
+          let best = null, bestY = Infinity;
+          zoneMates.forEach(o=>{
+            if(o.y < bestY){ bestY = o.y; best = o; }
+          });
+          targets[ballSideBottom] = clampToZone({ x: homes[ballSideBottom].x, y: best.y }, ballSideBottom);
+          engaged[ballSideBottom] = true;
+        }
+      }
+      // Opposite bottom defender: rotates over from his home corner toward bottom-center
+      // of the paint, looking to engage the ball carrier there.
+      {
+        const homeX = homes[oppBottom].x;
+        const p = h.lerp({x:homeX, y:PAINT.yNear}, {x:0, y:PAINT.yNear}, t);
+        targets[oppBottom] = clampToZone(p, oppBottom);
+        engaged[oppBottom] = t > 0.02;
+      }
+      // Ball-side top defender: rotates in sync, from his inner-box corner over to where
+      // the TL/TR split line meets the top of the inner box.
+      {
+        const p = h.lerp(innerCorners[ballSideTop], {x:0, y:INNER_BOX.yFar}, t);
+        targets[ballSideTop] = clampToZone(p, ballSideTop);
+      }
+      // Opposite top defender: rotates in sync, down from his inner-box corner to where
+      // the top/bottom split line meets his side of the inner box.
+      {
+        const ownSideX = oppTop === 'TR' ? INNER_BOX.xHalf : -INNER_BOX.xHalf;
+        const p = h.lerp(innerCorners[oppTop], {x:ownSideX, y:paintMidY}, t);
+        targets[oppTop] = clampToZone(p, oppTop);
+      }
+    } else if(inTopCenter && !multiplePaint){
+      // Top-center lane is the inside defender's alone - all 4 outer defenders pinch
+      // to the corners of the inner box.
+      targets.TL = innerCorners.TL;
+      targets.TR = innerCorners.TR;
+      targets.BL = innerCorners.BL;
+      targets.BR = innerCorners.BR;
+    } else {
+      // Normal case: the ball carrier's zone defender engages, and the diagonally
+      // opposite defender pinches in to the inner box's matching corner.
+      targets[ballZone] = clampToZone(fanClamp(ball), ballZone);
+      engaged[ballZone] = true;
+      const diag = DIAGONAL[ballZone];
+      targets[diag] = innerCorners[diag];
+    }
+
+    // Inside (help/lock-off) defender.
+    let insideTarget, insideEngaged;
+
+    if(multiplePaint){
+      insideTarget = {
+        x: occupants.reduce((s,o)=>s+o.x,0)/occupants.length,
+        y: occupants.reduce((s,o)=>s+o.y,0)/occupants.length
+      };
+      insideEngaged = true;
+    } else if(inTopCenter){
+      insideTarget = { x: h.clamp(ball.x, -TOP_CENTER.xHalf, TOP_CENTER.xHalf), y: Math.min(ball.y, FAN_R) };
+      insideEngaged = true;
+    } else if(occupants.length === 1){
+      const p = occupants[0];
+      const dAB = h.dist(p, ball);
+      if(dAB < 0.05){
+        insideTarget = {x:p.x, y:p.y};
+      } else {
+        const dir = {x:(ball.x-p.x)/dAB, y:(ball.y-p.y)/dAB};
+        const d = Math.min(1.1, dAB*0.45);
+        insideTarget = {x:p.x+dir.x*d, y:p.y+dir.y*d};
+      }
+      insideEngaged = true;
+    } else {
+      insideTarget = {x:0, y:paintMidY};
+      insideEngaged = false;
+    }
+
+    // Map each defender TOKEN (fixed index 0-3, fixed color) to whatever zone role it
+    // currently holds, per the permanent rotation state - not the fixed TL/TR/BL/BR order.
+    const result = defenderRoles.map((role,i) => ({ pos: targets[role], engaged: engaged[role], color: BOX_AND_ONE_COLORS[i] }));
+    result.push({ pos: insideTarget, engaged: insideEngaged, color: BOX_AND_ONE_COLORS[4] });
+    // No box-and-1 defender ever plays below the bottom edge of the paint.
+    result.forEach(d => { d.pos = {x:d.pos.x, y:Math.max(d.pos.y, PAINT.yNear)}; });
+    return result;
+  }
+
+  // ---------------- zone overlay (lines + labels) ----------------
+  function renderZoneOverlay(zoneLayer){
+    const ZC = { TL:'#8e44ad', TR:'#16a085', BL:'#2980b9', BR:'#e91e8c' };
+    const GRAY = '#9aa0a6';
+    const lineOpts = { stroke:GRAY, 'stroke-width':1.5, 'stroke-dasharray':'6 5', opacity:0.6 };
+
+    // left/right split (x = 0), from the goal out to the top of the box
+    {
+      const p1 = h.toPx({x:0, y:0}), p2 = h.toPx({x:0, y:h.FIELD_Y[1]});
+      zoneLayer.appendChild(h.el('line', {x1:p1.x,y1:p1.y,x2:p2.x,y2:p2.y, ...lineOpts}));
+    }
+    // top/bottom split (y = paint mid)
+    {
+      const p1 = h.toPx({x:FIELD_X[0], y:paintMidY}), p2 = h.toPx({x:FIELD_X[1], y:paintMidY});
+      zoneLayer.appendChild(h.el('line', {x1:p1.x,y1:p1.y,x2:p2.x,y2:p2.y, ...lineOpts}));
+    }
+    // top-center lane (inside defender's exclusive turf, unless the paint is crowded)
+    {
+      const tl = h.toPx({x:-TOP_CENTER.xHalf, y:TOP_CENTER.yFar});
+      const br = h.toPx({x:TOP_CENTER.xHalf, y:TOP_CENTER.yNear});
+      zoneLayer.appendChild(h.el('rect', {
+        x:tl.x, y:tl.y, width:(br.x-tl.x), height:(br.y-tl.y),
+        fill:'rgba(154,160,166,0.08)', stroke:GRAY, 'stroke-width':1.5, 'stroke-dasharray':'6 5', opacity:0.75
+      }));
+      const capL = h.toPx({x:-TOP_CENTER.xHalf, y:FAN_R}), capR = h.toPx({x:TOP_CENTER.xHalf, y:FAN_R});
+      zoneLayer.appendChild(h.el('line', {
+        x1:capL.x, y1:capL.y, x2:capR.x, y2:capR.y,
+        stroke:GRAY, 'stroke-width':1, 'stroke-dasharray':'2 4', opacity:0.9
+      }));
+    }
+    // zone labels
+    const labelPts = [
+      {t:'TL', x:-PAINT.xHalf-1.5, y:paintMidY+3, c:ZC.TL},
+      {t:'TR', x: PAINT.xHalf+1.5, y:paintMidY+3, c:ZC.TR},
+      {t:'BL', x:-PAINT.xHalf-1.5, y:paintMidY-3, c:ZC.BL},
+      {t:'BR', x: PAINT.xHalf+1.5, y:paintMidY-3, c:ZC.BR}
+    ];
+    labelPts.forEach(lp=>{
+      const p = h.toPx({x:lp.x, y:lp.y});
+      const t = h.el('text', {
+        x:p.x, y:p.y, 'text-anchor':'middle', 'font-size':'13', fill:lp.c,
+        'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', opacity:0.85
+      });
+      t.textContent = lp.t;
+      zoneLayer.appendChild(t);
+    });
+  }
+
+  DefenseEngine.init({
+    initialOffense: [
+      {x:0,   y:9},   // top-center attacker (default: has the ball)
+      {x:-11, y:5},   // left wing
+      {x:11,  y:5},   // right wing
+      {x:-7,  y:1.5}, // low / X attackman
+      {x:7,   y:1.5}, // low attackman, opposite side
+      {x:0,   y:14}   // top attackman
+    ],
+    initialBallIndex: 0,
+    attackerCount: { adjustable: false }, // always 6v5
+
+    onBeforeRender(offense, ballIndex){
+      evaluateLiveRotation(offense, ballIndex);
+    },
+    onPass(newIdx, offense, ballIndex){
+      const fired = maybeFirePassRotation(newIdx, offense, ballIndex);
+      if(!fired){
+        // Any pass that doesn't itself trigger the rotation ends this wrap sequence -
+        // the ball has moved on to a player who never wrapped it himself.
+        rotationPending = false;
+      }
+      // A pass is an instantaneous possession change, not a drag. Resync tracking to
+      // the receiver's current zone so trigger 1's live edge-detection - which runs on
+      // the very next render, now using the receiver's position as "the ball" - can't
+      // mistake that teleport for "just arrived here by carrying it in." Without this,
+      // a receiver who merely happens to already be standing in a bottom zone fires
+      // trigger 1 on the next frame regardless of the pass's own distance check.
+      prevBallZone = zoneOf(offense[newIdx]);
+    },
+    onReset(offense, ballIndex){
+      resetRotationState(offense, ballIndex);
+    },
+    drawZoneOverlay(zoneLayer){
+      renderZoneOverlay(zoneLayer);
+    },
+    computeDefenders(offense, ballIndex){
+      return computeBoxAndOne(offense, ballIndex);
+    }
+  });
+})();
+</script>
+</body>
+</html>

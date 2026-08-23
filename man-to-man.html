@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Man to Man - Defense Trainer</title>
+<link rel="stylesheet" href="shared/style.css">
+</head>
+<body>
+
+<div class="app-minimal">
+  <div class="field-card">
+    <div class="field-title-row">
+      <a href="index.html" class="back-link">&larr; All Defenses</a>
+      <span class="scheme-label">Man to Man</span>
+      <span class="status attacker-counter">
+        <button class="ctl round" id="addBtn" aria-label="Add attacker">+</button>
+        Attackers: <b id="countLabel">4</b>
+        <button class="ctl round" id="removeBtn" aria-label="Remove attacker">&minus;</button>
+      </span>
+    </div>
+    <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
+    <p class="hint">Drag any dot to move it. Click (don't drag) an orange dot to give it the ball.</p>
+    <div class="minimal-controls">
+      <button class="ctl" id="resetBtn">Reset Positions</button>
+    </div>
+  </div>
+</div>
+
+<script src="shared/defense-engine.js"></script>
+<script>
+(function(){
+  const h = DefenseEngine.helpers;
+
+  // ---------------- man-to-man rules ----------------
+  const SAG_RANGE = 16;
+  const MIN_SAG = 0.12;
+  const MAX_SAG = 0.72;
+  const FAR_THRESHOLD = 20; // yd from ball -> collapse to the inner box instead of the paint edge
+
+  function computeManDefender(attacker, ball, isOnBall){
+    let target;
+
+    if(isOnBall){
+      // On-ball defender: play the ball-you-goal line, tight pressure.
+      const t = h.clamp(h.dist(attacker, ball) / SAG_RANGE, 0, 1);
+      const sag = MIN_SAG + (MAX_SAG-MIN_SAG)*t;
+      target = h.lerp(attacker, h.GOAL, sag);
+    } else if(h.inPaint(attacker)){
+      // Paint rule: play right next to your player, positioned between them and the ball.
+      const dAB = h.dist(attacker, ball);
+      const tightDist = 1.1; // yards off their hip
+      if(dAB < 0.05){
+        target = {x:attacker.x, y:attacker.y};
+      } else {
+        const dir = {x:(ball.x-attacker.x)/dAB, y:(ball.y-attacker.y)/dAB};
+        const d = Math.min(tightDist, dAB*0.45);
+        target = {x: attacker.x + dir.x*d, y: attacker.y + dir.y*d};
+      }
+    } else {
+      // Off-ball, outside the paint: sag to the nearest edge of the paint (minimum).
+      // Beyond 20 yd from the ball, collapse further to the inner 5x5 yd box.
+      const dBallMan = h.dist(attacker, ball);
+      if(dBallMan > FAR_THRESHOLD){
+        target = h.nearestRectPoint(attacker, h.INNER_BOX);
+      } else {
+        target = h.nearestRectPoint(attacker, h.PAINT);
+      }
+    }
+
+    // defenders are allowed inside the crease (only offensive players are restricted there)
+    target.x = h.clamp(target.x, h.FIELD_X[0]+1, h.FIELD_X[1]-1);
+    target.y = h.clamp(target.y, h.FIELD_Y[0]+1, h.FIELD_Y[1]-1);
+    return target;
+  }
+
+  DefenseEngine.init({
+    initialOffense: [
+      {x:0,  y:9},   // top-center attacker (default: has the ball)
+      {x:-11, y:5},  // left wing
+      {x:11,  y:5},  // right wing
+      {x:-7,  y:1.5} // low / X attackman
+    ],
+    initialBallIndex: 0,
+    attackerCount: { adjustable: true, min: 2, max: 6 },
+    defaultDefenderColor: '#2f9bd6',
+
+    computeDefenders(offense, ballIndex){
+      const ball = offense[ballIndex];
+      return offense.map((a,i) => ({
+        pos: computeManDefender(a, ball, i === ballIndex),
+        engaged: i === ballIndex
+      }));
+    },
+
+    // denial lanes: defender -> their own man, for teaching cue
+    drawLanes(laneLayer, defenders, offense){
+      defenders.forEach((d,i)=>{
+        const p1 = h.toPx(d.pos), p2 = h.toPx(offense[i]);
+        laneLayer.appendChild(h.el('line', {
+          x1:p1.x,y1:p1.y,x2:p2.x,y2:p2.y,
+          stroke:'rgba(255,255,255,0.4)', 'stroke-width':1.5, 'stroke-dasharray':'4 5'
+        }));
+      });
+    }
+  });
+})();
+</script>
+</body>
+</html>
