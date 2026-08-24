@@ -191,6 +191,10 @@
     // approach is "engaged" but on an OFF-BALL mirror assignment, not the ball itself.
     // Used for the "BALL" communication call.
     let onBallRole = null;
+    // True specifically when the ball is in the top-center lane and the inside
+    // defender has picked it up directly - none of the 4 outer zones are "on the
+    // ball" in that case, but TL/TR still flank him and should call LEFT/RIGHT.
+    let insideHasBallInTopCenter = false;
 
     const occupants = offense.filter(o => h.inPaint(o));
     const multiplePaint = occupants.length > 1;
@@ -258,11 +262,14 @@
       }
     } else if(inTopCenter && !multiplePaint){
       // Top-center lane is the inside defender's alone - all 4 outer defenders pinch
-      // to the corners of the inner box.
+      // to the corners of the inner box. TL and TR still flank him though, so they
+      // call LEFT/RIGHT off the inside defender's own on-ball status (see below) -
+      // BL and BR are far enough away that they stay on the generic TWO call.
       targets.TL = innerCorners.TL;
       targets.TR = innerCorners.TR;
       targets.BL = innerCorners.BL;
       targets.BR = innerCorners.BR;
+      insideHasBallInTopCenter = true;
     } else {
       // Normal case: the ball carrier's zone defender engages, and the diagonally
       // opposite defender pinches in to the inner box's matching corner.
@@ -330,10 +337,17 @@
     // Communication calls for the 4 outer zone defenders (box-and-1 never calls "HOT" -
     // that's man-to-man only). Whichever token currently holds onBallRole calls "BALL";
     // its two RIGHT_OF_ROLE/LEFT_OF_ROLE neighbors call "RIGHT"/"LEFT"; everyone else -
-    // effectively always sagging/zoning in this scheme - calls "TWO".
+    // effectively always sagging/zoning in this scheme - calls "TWO". When the INSIDE
+    // defender is the one on the ball instead (top-center lane), no outer zone is
+    // "onBallRole" - but TL/TR still flank him, so they get RIGHT_OF_ROLE/LEFT_OF_ROLE
+    // treatment relative to TR (his natural right-side neighbor in the same fixed ring).
     const onBallTokenIdx = onBallRole ? defenderRoles.indexOf(onBallRole) : null;
-    const rightIdx = onBallRole ? defenderRoles.indexOf(RIGHT_OF_ROLE[onBallRole]) : null;
-    const leftIdx  = onBallRole ? defenderRoles.indexOf(LEFT_OF_ROLE[onBallRole])  : null;
+    let rightIdx = onBallRole ? defenderRoles.indexOf(RIGHT_OF_ROLE[onBallRole]) : null;
+    let leftIdx  = onBallRole ? defenderRoles.indexOf(LEFT_OF_ROLE[onBallRole])  : null;
+    if(insideHasBallInTopCenter){
+      rightIdx = defenderRoles.indexOf('TR');
+      leftIdx  = defenderRoles.indexOf('TL');
+    }
     const outerCalls = defenderRoles.map((role, i) => {
       if(i === onBallTokenIdx) return 'BALL';
       if(i === rightIdx) return 'RIGHT';
