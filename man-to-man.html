@@ -19,6 +19,12 @@
         <button class="ctl round" id="removeBtn" aria-label="Remove attacker">&minus;</button>
       </span>
     </div>
+    <div class="toolbar-row">
+      <label class="comm-toggle">
+        <input type="checkbox" id="commToggle">
+        Communication
+      </label>
+    </div>
     <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
     <p class="hint">Drag any dot to move it. Click (don't drag) an orange dot to give it the ball.</p>
     <div class="minimal-controls">
@@ -87,10 +93,51 @@
 
     computeDefenders(offense, ballIndex){
       const ball = offense[ballIndex];
-      return offense.map((a,i) => ({
-        pos: computeManDefender(a, ball, i === ballIndex),
-        engaged: i === ballIndex
-      }));
+      const positions = offense.map((a,i) => computeManDefender(a, ball, i === ballIndex));
+
+      // Communication calls.
+      // - On-ball defender: "BALL".
+      // - RIGHT/LEFT represent the on-ball defender's OWN right/left as he faces the
+      //   ball carrier - the defender covering the next off-ball attacker clockwise
+      //   around the goal from the ball carrier is "RIGHT," counter-clockwise is
+      //   "LEFT." This only ever considers attackers OUTSIDE the paint - a paint
+      //   attacker is never selected as a neighbor, and the ring naturally skips past
+      //   him to find the next qualifying one instead.
+      // - A defender covering an attacker who is actually in the paint calls "HOT" -
+      //   unless more than one defender is covering a paint attacker, in which case
+      //   only whichever one is closest to the ball says "HOT" and the rest say "TWO".
+      // - Anyone else off-ball, sagging (not in the paint themselves): "TWO".
+      const ringOwners = [];
+      const ringPoints = [];
+      offense.forEach((a,i) => {
+        if(i === ballIndex || !h.inPaint(a)){
+          ringOwners.push(i);
+          ringPoints.push(a);
+        }
+      });
+      const ballRingPos = ringOwners.indexOf(ballIndex);
+      const { cwIdx, ccwIdx } = h.findRingNeighbors(ringPoints, ballRingPos);
+      const rightIdx = (cwIdx !== null) ? ringOwners[cwIdx] : null;
+      const leftIdx = (ccwIdx !== null) ? ringOwners[ccwIdx] : null;
+
+      const paintCoverers = [];
+      offense.forEach((a,i) => { if(i !== ballIndex && h.inPaint(a)) paintCoverers.push(i); });
+      let hotIdx = null, hotDist = Infinity;
+      paintCoverers.forEach(i => {
+        const d = h.dist(offense[i], ball);
+        if(d < hotDist){ hotDist = d; hotIdx = i; }
+      });
+
+      return offense.map((a,i) => {
+        let call;
+        if(i === ballIndex) call = 'BALL';
+        else if(i === rightIdx) call = 'RIGHT';
+        else if(i === leftIdx) call = 'LEFT';
+        else if(h.inPaint(a)) call = (i === hotIdx) ? 'HOT' : 'TWO';
+        else call = 'TWO';
+
+        return { pos: positions[i], engaged: i === ballIndex, call };
+      });
     },
 
     // denial lanes: defender -> their own man, for teaching cue

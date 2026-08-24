@@ -15,6 +15,12 @@
       <span class="scheme-label">Box and 1</span>
       <span></span>
     </div>
+    <div class="toolbar-row">
+      <label class="comm-toggle">
+        <input type="checkbox" id="commToggle">
+        Communication
+      </label>
+    </div>
     <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
     <p class="hint">Drag any dot to move it. Click (don't drag) an orange dot to give it the ball. Carry the ball around behind the goal and up into the bottom zone to trigger the rotation, or pass to the opposite low man from within 1 yard of GLE to beat the slide.</p>
     <div class="minimal-controls">
@@ -66,6 +72,21 @@
   }
 
   const DIAGONAL = { TL:'BR', TR:'BL', BL:'TR', BR:'TL' };
+
+  // Fixed zone-topology adjacency for the RIGHT/LEFT communication calls. Each outer
+  // zone's home position sits at a fixed angle around the goal, so the clockwise/
+  // counter-clockwise order of the 4 corners never changes: BL -> TL -> TR -> BR ->
+  // (back to BL). The on-ball defender faces the ball carrier, and RIGHT/LEFT are HIS
+  // own right/left - the zone one step clockwise from him is "RIGHT," one step
+  // counter-clockwise is "LEFT." Deliberately NOT based on current on-screen
+  // x-position, which ties whenever two zones share a home x (TL and BL are both on
+  // the left side) - this is the structurally fixed relationship between corners, so
+  // it stays correct and consistent no matter where the ball currently is, and (since
+  // the defensive rotation itself is just a shift around this same ring) it's also
+  // invariant across rotations: whichever token is to a given token's right stays his
+  // right, no matter how many times the defense has rotated.
+  const RIGHT_OF_ROLE = { BL:'TL', TL:'TR', TR:'BR', BR:'BL' };
+  const LEFT_OF_ROLE  = { BL:'BR', TL:'BL', TR:'TL', BR:'TR' };
 
   // ---------------- permanent rotation state ----------------
   // defenderRoles[i] = which zone role (TL/TR/BL/BR) defender token i currently plays.
@@ -165,6 +186,11 @@
     // Default: everyone sits home unless a rule below says otherwise.
     const targets = { TL:homes.TL, TR:homes.TR, BL:homes.BL, BR:homes.BR };
     const engaged = { TL:false, TR:false, BL:false, BR:false };
+    // Which zone role, if any, is directly guarding the literal ball carrier - distinct
+    // from `engaged`, since e.g. the ball-side-bottom defender during the 'behind'
+    // approach is "engaged" but on an OFF-BALL mirror assignment, not the ball itself.
+    // Used for the "BALL" communication call.
+    let onBallRole = null;
 
     const occupants = offense.filter(o => h.inPaint(o));
     const multiplePaint = occupants.length > 1;
@@ -207,12 +233,15 @@
         }
       }
       // Opposite bottom defender: rotates over from his home corner toward bottom-center
-      // of the paint, looking to engage the ball carrier there.
+      // of the paint, looking to engage the ball carrier there. This is the defender
+      // actually closing on the literal ball, so he's the one who calls "BALL" once
+      // he's meaningfully underway.
       {
         const homeX = homes[oppBottom].x;
         const p = h.lerp({x:homeX, y:PAINT.yNear}, {x:0, y:PAINT.yNear}, t);
         targets[oppBottom] = clampToZone(p, oppBottom);
         engaged[oppBottom] = t > 0.02;
+        if(engaged[oppBottom]) onBallRole = oppBottom;
       }
       // Ball-side top defender: rotates in sync, from his inner-box corner over to where
       // the TL/TR split line meets the top of the inner box.
@@ -239,12 +268,32 @@
       // opposite defender pinches in to the inner box's matching corner.
       targets[ballZone] = clampToZone(fanClamp(ball), ballZone);
       engaged[ballZone] = true;
+      onBallRole = ballZone;
       const diag = DIAGONAL[ballZone];
       targets[diag] = innerCorners[diag];
     }
 
+    // Attacking a static box-and-1 with two attackers in the paint is a real structural
+    // problem for this scheme - the standard zone logic above reacts to the BALL, which
+    // can leave an outer defender's own zone-mate wide open if the ball is elsewhere.
+    // This isn't a fix so much as an acknowledgment: when the paint is crowded, any
+    // outer zone whose own half of the paint holds exactly one off-ball attacker shades
+    // directly toward him - tighter, more man-like - while still clamped to his zone
+    // (clampToZone below), never abandoning zone principles outright. The zone
+    // currently on the literal ball is left alone; this only applies to the others.
+    if(multiplePaint){
+      ['TL','TR','BL','BR'].forEach(role => {
+        if(role === onBallRole) return;
+        const zoneOccupants = occupants.filter(o => o !== ball && zoneOf(o) === role);
+        if(zoneOccupants.length === 1){
+          targets[role] = clampToZone({ x: zoneOccupants[0].x, y: zoneOccupants[0].y }, role);
+          engaged[role] = true;
+        }
+      });
+    }
+
     // Inside (help/lock-off) defender.
-    let insideTarget, insideEngaged;
+    let insideTarget, insideEngaged, insideCall;
 
     if(multiplePaint){
       insideTarget = {
@@ -252,9 +301,11 @@
         y: occupants.reduce((s,o)=>s+o.y,0)/occupants.length
       };
       insideEngaged = true;
+      insideCall = ''; // covering multiple paint attackers - stays silent
     } else if(inTopCenter){
       insideTarget = { x: h.clamp(ball.x, -TOP_CENTER.xHalf, TOP_CENTER.xHalf), y: Math.min(ball.y, FAN_R) };
       insideEngaged = true;
+      insideCall = 'BALL'; // he's the one directly on the ball carrier here
     } else if(occupants.length === 1){
       const p = occupants[0];
       const dAB = h.dist(p, ball);
@@ -266,15 +317,34 @@
         insideTarget = {x:p.x+dir.x*d, y:p.y+dir.y*d};
       }
       insideEngaged = true;
+      // The sole paint occupant might be the ball carrier himself (ball dragged into
+      // the paint) - if so, he's on the ball. Otherwise it's an off-ball attacker in
+      // the paint, and per the rule, the inside defender stays silent covering him.
+      insideCall = (p === ball) ? 'BALL' : '';
     } else {
       insideTarget = {x:0, y:paintMidY};
       insideEngaged = false;
+      insideCall = '';
     }
+
+    // Communication calls for the 4 outer zone defenders (box-and-1 never calls "HOT" -
+    // that's man-to-man only). Whichever token currently holds onBallRole calls "BALL";
+    // its two RIGHT_OF_ROLE/LEFT_OF_ROLE neighbors call "RIGHT"/"LEFT"; everyone else -
+    // effectively always sagging/zoning in this scheme - calls "TWO".
+    const onBallTokenIdx = onBallRole ? defenderRoles.indexOf(onBallRole) : null;
+    const rightIdx = onBallRole ? defenderRoles.indexOf(RIGHT_OF_ROLE[onBallRole]) : null;
+    const leftIdx  = onBallRole ? defenderRoles.indexOf(LEFT_OF_ROLE[onBallRole])  : null;
+    const outerCalls = defenderRoles.map((role, i) => {
+      if(i === onBallTokenIdx) return 'BALL';
+      if(i === rightIdx) return 'RIGHT';
+      if(i === leftIdx) return 'LEFT';
+      return 'TWO';
+    });
 
     // Map each defender TOKEN (fixed index 0-3, fixed color) to whatever zone role it
     // currently holds, per the permanent rotation state - not the fixed TL/TR/BL/BR order.
-    const result = defenderRoles.map((role,i) => ({ pos: targets[role], engaged: engaged[role], color: BOX_AND_ONE_COLORS[i] }));
-    result.push({ pos: insideTarget, engaged: insideEngaged, color: BOX_AND_ONE_COLORS[4] });
+    const result = defenderRoles.map((role,i) => ({ pos: targets[role], engaged: engaged[role], color: BOX_AND_ONE_COLORS[i], call: outerCalls[i] }));
+    result.push({ pos: insideTarget, engaged: insideEngaged, color: BOX_AND_ONE_COLORS[4], call: insideCall });
     // No box-and-1 defender ever plays below the bottom edge of the paint.
     result.forEach(d => { d.pos = {x:d.pos.x, y:Math.max(d.pos.y, PAINT.yNear)}; });
     return result;

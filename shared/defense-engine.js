@@ -95,10 +95,38 @@
   // Inner 5x5 yd box, centered in the paint - the deepest a weak-side defender collapses to.
   const INNER_BOX = { xHalf: 2.5, yNear: paintMidY - 2.5, yFar: paintMidY + 2.5 };
 
+  // The on-ball defender is facing the ball carrier, and RIGHT/LEFT communication
+  // calls represent HIS OWN left/right - i.e. who's covering the next attacker around
+  // the goal from him, going clockwise (his right) vs counter-clockwise (his left).
+  // "Around the goal" - not simple x-position - because a defender's own left/right
+  // rotates with wherever on the field he actually is; a clockwise/counter-clockwise
+  // ring naturally stays correct regardless of where play is happening.
+  //
+  // angleAroundGoal: 0 = straight upfield, increasing = clockwise (matches the fan/
+  // shot-angle convention used elsewhere - dx,dy order intentionally swapped so
+  // "straight ahead" is angle 0).
+  function angleAroundGoal(pt){
+    return Math.atan2(pt.x - GOAL.x, pt.y - GOAL.y);
+  }
+
+  // Given a list of {x,y} points (e.g. offensive players, or zone home positions) and
+  // the index of whichever one is "on the ball," find the immediate clockwise and
+  // counter-clockwise neighbors around the goal (wrapping past +/-180deg correctly).
+  // Returns { cwIdx, ccwIdx }.
+  function findRingNeighbors(points, onBallIdx){
+    if(onBallIdx === null || onBallIdx === undefined) return { cwIdx: null, ccwIdx: null };
+    const order = points.map((p,i) => ({ i, a: angleAroundGoal(p) })).sort((p,q) => p.a - q.a);
+    const pos = order.findIndex(e => e.i === onBallIdx);
+    if(pos === -1 || order.length < 2) return { cwIdx: null, ccwIdx: null };
+    const cwIdx = order[(pos + 1) % order.length].i;
+    const ccwIdx = order[(pos - 1 + order.length) % order.length].i;
+    return { cwIdx, ccwIdx };
+  }
+
   const helpers = {
     toPx, toYd, dist, lerp, clamp, el,
     GOAL, PAINT, INNER_BOX, paintMidY, FIELD_X, FIELD_Y,
-    inPaint, nearestRectPoint
+    inPaint, nearestRectPoint, angleAroundGoal, findRingNeighbors
   };
 
   function buildField(staticLayer){
@@ -255,9 +283,16 @@
         const dot = el('circle', {cx:0, cy:0, r:11, fill:'#2f9bd6', stroke:'#123', 'stroke-width':1.5, class:'defender-dot'});
         const label = el('text', {x:0, y:4, 'text-anchor':'middle', 'font-size':'11', fill:'#fff', 'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', class:'defender-label'});
         label.textContent = 'D';
-        g.appendChild(ring); g.appendChild(dot); g.appendChild(label);
+        // Communication call-out: a pill below the token, shown only when the
+        // COMMUNICATION toggle is on and this defender has something to say. Sized
+        // 3x the original for readability.
+        const callBg = el('rect', {x:-24, y:18, width:48, height:45, rx:10, fill:'rgba(10,15,13,0.88)', stroke:'rgba(255,255,255,0.25)', 'stroke-width':1.5, class:'call-bg'});
+        callBg.style.display = 'none';
+        const callText = el('text', {x:0, y:51, 'text-anchor':'middle', 'font-size':'28', fill:'#f4efe3', 'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', 'letter-spacing':'0.03em', class:'call-text'});
+        callText.style.display = 'none';
+        g.appendChild(ring); g.appendChild(dot); g.appendChild(label); g.appendChild(callBg); g.appendChild(callText);
         defenderLayer.appendChild(g);
-        defenderNodes.push({g, ring, dot, label});
+        defenderNodes.push({g, ring, dot, label, callBg, callText});
       }
       while(defenderNodes.length > n){
         const node = defenderNodes.pop();
@@ -318,13 +353,32 @@
       // defender tokens: update persistent nodes so movement animates smoothly.
       // "engaged" defenders snap instantly instead, tracking with no delay.
       ensureDefenderNodes(defenders.length);
+      const commOn = commToggleEl ? commToggleEl.checked : false;
       defenders.forEach((d,i)=>{
         const p = toPx(d.pos);
         const node = defenderNodes[i];
         node.ring.style.display = d.engaged ? '' : 'none';
         node.g.style.transition = d.engaged ? 'none' : '';
+        if(d.engaged) node.g.getBoundingClientRect(); // force a reflow so the browser
+          // actually commits transition:none before the transform below changes -
+          // otherwise an element that was mid-transition can keep animating from its
+          // stale position instead of snapping instantly, since setting transition
+          // and transform in the same tick doesn't reliably cancel an in-flight one.
         node.g.setAttribute('transform', `translate(${p.x} ${p.y})`);
         node.dot.setAttribute('fill', d.color || config.defaultDefenderColor || '#2f9bd6');
+
+        const call = commOn ? (d.call || '') : '';
+        if(call){
+          node.callText.textContent = call;
+          const w = Math.max(90, call.length*19.5+36); // 3x the original width formula
+          node.callBg.setAttribute('x', -w/2);
+          node.callBg.setAttribute('width', w);
+          node.callBg.style.display = '';
+          node.callText.style.display = '';
+        } else {
+          node.callBg.style.display = 'none';
+          node.callText.style.display = 'none';
+        }
       });
 
       // offense tokens (draggable + clickable): update persistent nodes in place.
@@ -406,6 +460,12 @@
       render();
     }
 
+    // ---------------- communication toggle ----------------
+    const commToggleEl = document.getElementById('commToggle');
+    if(commToggleEl){
+      commToggleEl.addEventListener('change', render);
+    }
+
     // ---------------- attacker count controls ----------------
     function addAttacker(){
       offense.push({ x: (Math.random()*24-12), y: 6 + Math.random()*8 });
@@ -452,13 +512,23 @@
     // ---------------- fit-to-container sizing ----------------
     const appEl = document.querySelector('.app-minimal');
     const cardEl = document.querySelector('.field-card');
-    const titleRowEl = document.querySelector('.field-title-row');
-    const hintEl = document.querySelector('.hint');
 
     function fitField(){
       const padding = 32;
       const gaps = 20;
-      const availableH = window.innerHeight - padding - titleRowEl.offsetHeight - (hintEl ? hintEl.offsetHeight : 0) - gaps;
+      // Sum the height of every sibling of the SVG inside the card (title row,
+      // toolbar row, hint text, controls, etc.) rather than hardcoding specific
+      // elements - so this keeps working correctly as rows are added or removed,
+      // instead of silently under-measuring and causing the SVG to be sized taller
+      // than what actually fits (which then gets compressed by CSS, throwing off
+      // the aspect ratio and making drag coordinates track inaccurately).
+      let siblingsHeight = 0;
+      Array.from(cardEl.children).forEach(child => {
+        if(child === svg) return;
+        const cs = getComputedStyle(child);
+        siblingsHeight += child.offsetHeight + parseFloat(cs.marginTop || 0) + parseFloat(cs.marginBottom || 0);
+      });
+      const availableH = window.innerHeight - padding - siblingsHeight - gaps;
       const availableW = cardEl.clientWidth;
 
       const ratio = 880/760;
