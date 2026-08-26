@@ -17,6 +17,10 @@
                  | { adjustable: false, fixed: 6 },
 
     defaultDefenderColor: '#2f9bd6',    // used when a defender target has no color of its own
+    alwaysSmoothMovement: false,        // opt out of the instant-snap behavior for
+                                         // engaged defenders entirely - they still get
+                                         // the ring highlight, they just glide there
+                                         // like everyone else instead of teleporting
 
     // REQUIRED. Given the offense array and who has the ball, return one entry
     // per defender: { pos:{x,y}, engaged:bool, color?:'#hex' }.
@@ -94,6 +98,32 @@
   const paintMidY = (PAINT.yNear + PAINT.yFar) / 2;
   // Inner 5x5 yd box, centered in the paint - the deepest a weak-side defender collapses to.
   const INNER_BOX = { xHalf: 2.5, yNear: paintMidY - 2.5, yFar: paintMidY + 2.5 };
+
+  // "Good shot" zone: within 15 yards of goal, and not so far to the side that the
+  // goal appears narrower than about 2 feet wide to the shooter (matches the same
+  // 15yd/60deg geometry already used for Box and 1's on-ball defenders). Runs from
+  // the crease's visual edge (3 yd) outward, so it doesn't shade over the crease
+  // itself. Built as a many-point polygon approximating the arc rather than true SVG
+  // arc commands, since sweep-flag direction is easy to get backwards once yard-space
+  // (y-up) gets converted to pixel-space (y-down) - a polygon sidesteps that entirely
+  // and looks identically smooth at this point count.
+  const SHOT_ZONE_OUTER_R = 15;
+  const SHOT_ZONE_INNER_R = 3;
+  const SHOT_ZONE_HALF_ANGLE = Math.PI / 3; // 60 deg
+  function buildShotZonePath(){
+    const steps = 48;
+    const pts = [];
+    for(let i = 0; i <= steps; i++){
+      const t = -SHOT_ZONE_HALF_ANGLE + (2 * SHOT_ZONE_HALF_ANGLE) * (i / steps);
+      pts.push({ x: SHOT_ZONE_OUTER_R * Math.sin(t), y: SHOT_ZONE_OUTER_R * Math.cos(t) });
+    }
+    for(let i = 0; i <= steps; i++){
+      const t = SHOT_ZONE_HALF_ANGLE - (2 * SHOT_ZONE_HALF_ANGLE) * (i / steps);
+      pts.push({ x: SHOT_ZONE_INNER_R * Math.sin(t), y: SHOT_ZONE_INNER_R * Math.cos(t) });
+    }
+    const pxPts = pts.map(toPx);
+    return 'M ' + pxPts.map(p => `${p.x.toFixed(2)} ${p.y.toFixed(2)}`).join(' L ') + ' Z';
+  }
 
   // The on-ball defender is facing the ball carrier, and RIGHT/LEFT communication
   // calls represent HIS OWN left/right - i.e. who's covering the next attacker around
@@ -281,8 +311,6 @@
         const ring = el('circle', {cx:0, cy:0, r:15, fill:'none', stroke:'#e8452c', 'stroke-width':2.5, class:'onball-ring'});
         ring.style.display = 'none';
         const dot = el('circle', {cx:0, cy:0, r:11, fill:'#2f9bd6', stroke:'#123', 'stroke-width':1.5, class:'defender-dot'});
-        const label = el('text', {x:0, y:4, 'text-anchor':'middle', 'font-size':'11', fill:'#fff', 'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', class:'defender-label'});
-        label.textContent = 'D';
         // Communication call-out: a pill below the token, shown only when the
         // COMMUNICATION toggle is on and this defender has something to say. Sized
         // 3x the original for readability.
@@ -290,9 +318,9 @@
         callBg.style.display = 'none';
         const callText = el('text', {x:0, y:51, 'text-anchor':'middle', 'font-size':'28', fill:'#f4efe3', 'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', 'letter-spacing':'0.03em', class:'call-text'});
         callText.style.display = 'none';
-        g.appendChild(ring); g.appendChild(dot); g.appendChild(label); g.appendChild(callBg); g.appendChild(callText);
+        g.appendChild(ring); g.appendChild(dot); g.appendChild(callBg); g.appendChild(callText);
         defenderLayer.appendChild(g);
-        defenderNodes.push({g, ring, dot, label, callBg, callText});
+        defenderNodes.push({g, ring, dot, callBg, callText});
       }
       while(defenderNodes.length > n){
         const node = defenderNodes.pop();
@@ -311,7 +339,7 @@
         const paintRing = el('circle', {cx:0, cy:0, r:17, fill:'none', stroke:'#f2c14e', 'stroke-width':2, 'stroke-dasharray':'3 3'});
         paintRing.style.display = 'none';
         const dot = el('circle', {cx:0, cy:0, r:13, stroke:'#3a1c0f', 'stroke-width':1.5});
-        const label = el('text', {x:0, y:4, 'text-anchor':'middle', 'font-size':'11', fill:'#1b0f08', 'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', 'pointer-events':'none'});
+        const label = el('text', {x:0, y:5, 'text-anchor':'middle', 'font-size':'16', fill:'#1b0f08', 'font-family':"'Barlow Condensed', sans-serif", 'font-weight':'700', 'pointer-events':'none'});
         g.appendChild(hit); g.appendChild(paintRing); g.appendChild(dot); g.appendChild(label);
         offenseLayer.appendChild(g);
         attachDrag(g, idx);
@@ -334,6 +362,16 @@
 
       const ball = offense[ballIndex];
 
+      if(shotZoneToggleEl && shotZoneToggleEl.checked){
+        zoneLayer.appendChild(el('path', {
+          d: buildShotZonePath(),
+          fill: 'rgba(242,193,78,0.16)',
+          stroke: 'rgba(242,193,78,0.55)',
+          'stroke-width': 1.5,
+          'stroke-dasharray': '5 4'
+        }));
+      }
+
       if(config.onBeforeRender) config.onBeforeRender(offense, ballIndex, helpers);
       if(config.drawZoneOverlay) config.drawZoneOverlay(zoneLayer, helpers);
 
@@ -354,12 +392,19 @@
       // "engaged" defenders snap instantly instead, tracking with no delay.
       ensureDefenderNodes(defenders.length);
       const commOn = commToggleEl ? commToggleEl.checked : false;
+      // Some schemes (Rotation) reshape the whole defense on every single pass, and
+      // having some defenders snap instantly while others glide looks jarring given
+      // how often that happens - so a page can opt out of the instant-snap behavior
+      // entirely via config.alwaysSmoothMovement while still keeping the engaged-ring
+      // highlight, which is a separate visual signal from how the token moves.
+      const smoothOverride = !!config.alwaysSmoothMovement;
       defenders.forEach((d,i)=>{
         const p = toPx(d.pos);
         const node = defenderNodes[i];
         node.ring.style.display = d.engaged ? '' : 'none';
-        node.g.style.transition = d.engaged ? 'none' : '';
-        if(d.engaged) node.g.getBoundingClientRect(); // force a reflow so the browser
+        const snapInstantly = d.engaged && !smoothOverride;
+        node.g.style.transition = snapInstantly ? 'none' : '';
+        if(snapInstantly) node.g.getBoundingClientRect(); // force a reflow so the browser
           // actually commits transition:none before the transform below changes -
           // otherwise an element that was mid-transition can keep animating from its
           // stale position instead of snapping instantly, since setting transition
@@ -466,6 +511,12 @@
       commToggleEl.addEventListener('change', render);
     }
 
+    // ---------------- shot zone overlay toggle ----------------
+    const shotZoneToggleEl = document.getElementById('shotZoneToggle');
+    if(shotZoneToggleEl){
+      shotZoneToggleEl.addEventListener('change', render);
+    }
+
     // ---------------- attacker count controls ----------------
     function addAttacker(){
       offense.push({ x: (Math.random()*24-12), y: 6 + Math.random()*8 });
@@ -514,8 +565,8 @@
     const cardEl = document.querySelector('.field-card');
 
     function fitField(){
-      const padding = 32;
-      const gaps = 20;
+      const padding = 16; // matches .app-minimal's 8px top + 8px bottom padding
+      const gaps = 6;     // small safety buffer against rounding, not a real layout gap
       // Sum the height of every sibling of the SVG inside the card (title row,
       // toolbar row, hint text, controls, etc.) rather than hardcoding specific
       // elements - so this keeps working correctly as rows are added or removed,
@@ -548,7 +599,7 @@
     if(window.ResizeObserver){ new ResizeObserver(fitField).observe(appEl); }
     fitField();
 
-    return { render };
+    return { render, reset: doReset };
   }
 
   window.DefenseEngine = { init, helpers };

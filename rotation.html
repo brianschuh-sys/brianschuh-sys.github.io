@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rotation - Defense Trainer</title>
+<link rel="stylesheet" href="shared/style.css">
+<style>
+  .mode-toggle{ display:inline-flex; gap:6px; }
+  .mode-toggle button{ padding:7px 12px; font-size:13px; }
+  .mode-toggle button.active{ background:var(--def-dark); border-color:var(--def); color:#fff; }
+</style>
+</head>
+<body>
+
+<div class="app-minimal">
+  <div class="field-card">
+    <div class="field-title-row">
+      <a href="index.html" class="back-link">&larr; All Defenses</a>
+      <span class="scheme-label-stack">
+        <span class="scheme-label">Rotation</span>
+        <span class="status mode-toggle">
+          <button class="ctl active" id="mode5Btn">5-Man</button>
+          <button class="ctl" id="mode4Btn">4-Man</button>
+        </span>
+      </span>
+      <span></span>
+    </div>
+    <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+  <div class="side-controls side-controls-left" id="leftControls">
+    <label class="comm-toggle">
+      <input type="checkbox" id="shotZoneToggle">
+      <span>Shot Zone</span>
+    </label>
+  </div>
+  <div class="side-controls side-controls-right" id="rightControls">
+    <label class="comm-toggle">
+      <input type="checkbox" id="commToggle">
+      <span>Communication</span>
+    </label>
+    <button class="ctl info-toggle" id="infoToggle">&#9432; About This Defense</button>
+  </div>
+  <div class="info-panel" id="infoPanel">
+    <div class="info-content" id="infoContent"></div>
+    <div class="info-nav">
+      <button id="infoPrev" aria-label="Previous">&larr; Back</button>
+      <span class="info-page-indicator" id="infoPageIndicator">1 / 1</span>
+      <button id="infoNext" aria-label="Next">Next &rarr;</button>
+    </div>
+  </div>
+</div>
+
+<script src="shared/defense-engine.js"></script>
+<script>
+(function(){
+  const h = DefenseEngine.helpers;
+  const { GOAL, INNER_BOX, PAINT } = h;
+
+  // ---------------- mode state ----------------
+  // 5-man = one man down, 4-man = two men down. Both share the same on-ball/adjacent/
+  // help role structure; 4-man just has a single help defender instead of two, since
+  // there's one fewer body to cover the leftover attackers.
+  let mode = '5man'; // '5man' | '4man'
+  function defenderCountForMode(){ return mode === '5man' ? 5 : 4; }
+
+  // Fixed token colors - color always stays with the physical token, never with a role,
+  // same principle as Box and 1.
+  const ROLE_COLORS = ['#8e44ad', '#2980b9', '#e91e8c', '#16a085', '#f1c40f']; // onball,cw1,ccw1,cwHelp/ccwHelp...
+  // Reassigned per-render based on seat, see computeDefenders.
+
+  // ---------------- persistent seat state ----------------
+  // tokenRing[i] = the token occupying seat i. Seats are fixed positions in a circle
+  // that NEVER reorder relative to each other - only which seat currently counts as
+  // "on ball" (onBallSeat) moves, exactly like turning a wheel: neighbors never change,
+  // the wheel just spins to bring a different spoke to the top.
+  let tokenRing = [0, 1, 2, 3, 4];
+  let onBallSeat = 0;
+  // The most recently computed seat -> position mapping, kept around specifically to
+  // break skip-pass ties by actual physical proximity rather than an arbitrary
+  // clockwise default - see shiftSeatsForPass.
+  let lastSeatPositions = [];
+
+  function resetRotationState(){
+    tokenRing = Array.from({length: defenderCountForMode()}, (_, i) => i);
+    onBallSeat = 0;
+    lastSeatPositions = [];
+  }
+
+  // ---------------- ring helpers (attacker-side geometry) ----------------
+  // Build the ring of [ball carrier + every off-ball, non-paint attacker], sorted by
+  // angle around the goal. Used to find the next/second-next attacker in each
+  // direction for the adjacent defenders' skip-line geometry.
+  function buildOffenseRing(offense, ballIndex){
+    const owners = [ballIndex];
+    const points = [offense[ballIndex]];
+    offense.forEach((a, i) => {
+      if(i !== ballIndex && !h.inPaint(a)){ owners.push(i); points.push(a); }
+    });
+    const order = owners.map((o, idx) => ({ o, a: h.angleAroundGoal(points[idx]) }));
+    order.sort((x, y) => x.a - y.a);
+    return order;
+  }
+  function ringNeighborOffenseIndex(offense, ballIndex, k){
+    const order = buildOffenseRing(offense, ballIndex);
+    const n = order.length;
+    const pos = order.findIndex(e => e.o === ballIndex);
+    if(pos === -1 || n < 2) return null;
+    const targetPos = ((pos + k) % n + n) % n;
+    if(targetPos === pos) return null;
+    return order[targetPos].o;
+  }
+
+  // ---------------- adjacent defender geometry ----------------
+  function lineIntersect(p1, p2, p3, p4){
+    const d1x = p2.x - p1.x, d1y = p2.y - p1.y;
+    const d2x = p4.x - p3.x, d2y = p4.y - p3.y;
+    const denom = d1x * d2y - d1y * d2x;
+    if(Math.abs(denom) < 1e-6) return null;
+    const t = ((p3.x - p1.x) * d2y - (p3.y - p1.y) * d2x) / denom;
+    // u is the SAME intersection's position along the second line (p3->p4): u=0 is
+    // p3, u=1 is p4. Needed so the adjacent defender can be kept from ever sliding
+    // past his own man along that line - see the u>1 check below.
+    const u = (d1y * (p3.x - p1.x) - d1x * (p3.y - p1.y)) / denom;
+    return { x: p1.x + t * d1x, y: p1.y + t * d1y, t, u };
+  }
+
+  const PAINT_CENTER = { x: 0, y: h.paintMidY };
+
+  // Liang-Barsky segment-vs-rectangle clipping: finds where a segment from an outside
+  // point toward an inside point first crosses into the paint's boundary. Used for the
+  // "skip pass is unrealistic" fallback below - the defender denies right at the edge
+  // of the paint along his own man's line to the center, rather than following a skip
+  // line to a target that was never a real threat.
+  function segmentEntersPaintAt(from, to){
+    const xMin = -PAINT.xHalf, xMax = PAINT.xHalf, yMin = PAINT.yNear, yMax = PAINT.yFar;
+    const dx = to.x - from.x, dy = to.y - from.y;
+    let t0 = 0, t1 = 1;
+    function clip(p, q){
+      if(Math.abs(p) < 1e-9) return q >= 0;
+      const r = q / p;
+      if(p < 0){ if(r > t1) return false; if(r > t0) t0 = r; }
+      else     { if(r < t0) return false; if(r < t1) t1 = r; }
+      return true;
+    }
+    if(!clip(-dx, from.x - xMin)) return null;
+    if(!clip(dx, xMax - from.x)) return null;
+    if(!clip(-dy, from.y - yMin)) return null;
+    if(!clip(dy, yMax - from.y)) return null;
+    return { x: from.x + dx * t0, y: from.y + dy * t0 };
+  }
+
+  // Named separately from the on-ball defender's radius cap below - these read the
+  // same "15 yards" at a glance but are NOT the same shape. This one is a plain
+  // y-coordinate (a horizontal line, like the 15-yard grid line drawn on the field),
+  // not a straight-line distance from goal. A wide attacker at (10,15) sits exactly
+  // on this line despite being ~18 yards from goal by straight-line distance; a
+  // radius check at 15 would already have excluded him well before he got there.
+  const SKIP_TARGET_DEPTH_CAP = 15;
+
+  // The adjacent defender normally stands on the skip line from the ball straight to
+  // the second-next attacker in his direction, shaded toward wherever the line from
+  // the CENTER OF THE PAINT to his own direct man crosses that skip line. Passes
+  // travel through the air, so the skip line is free to pass over the paint - there's
+  // no rule against the resulting position landing inside it. He abandons the
+  // skip-line construction entirely and instead sits where his own man's line to the
+  // center of the paint first crosses the paint's edge only when: the skip target is
+  // below GLE, or above the 15-yard depth line (SKIP_TARGET_DEPTH_CAP) - neither is a
+  // real scoring threat worth shading toward - or when the pure geometric
+  // intersection doesn't actually fall on the real skip segment at all (the two lines
+  // can easily cross well outside it for plenty of ordinary-looking formations). Same
+  // fallback every time - not a separate ad-hoc approximation for each case - so his
+  // position always corresponds to one of the two actual described rules, never an
+  // unrelated blend. Both depth checks apply only to the skip target, never to his
+  // own man. He never plays below the bottom of the paint - that floor only applies
+  // off-ball; the on-ball defender is exempt.
+  //
+  // He's also never allowed to slide PAST his own man on that reference line, out
+  // beyond him and farther from goal - that would mean abandoning proximity to the
+  // real, standing threat (his actual man) purely to sit on a skip lane, leaving that
+  // man wide open and closer to the crease than the defender covering him. If the
+  // pure intersection would require that, he holds at his own man's position
+  // instead - the farthest out this construction ever allows him to go.
+  function paintEdgeFallback(ownManPos){
+    const edge = segmentEntersPaintAt(ownManPos, PAINT_CENTER);
+    if(edge) return { x: edge.x, y: Math.max(edge.y, PAINT.yNear) };
+    const p = h.lerp(ownManPos, PAINT_CENTER, 0.4); // rare fallback if no crossing found
+    return { x: p.x, y: Math.max(p.y, PAINT.yNear) };
+  }
+  function adjacentTarget(ballPos, ownManPos, secondPos){
+    const skipIsUnrealistic = !secondPos || secondPos.y < 0 || secondPos.y > SKIP_TARGET_DEPTH_CAP;
+    if(skipIsUnrealistic) return paintEdgeFallback(ownManPos);
+
+    const hit = lineIntersect(ballPos, secondPos, PAINT_CENTER, ownManPos);
+    if(!hit || hit.t < 0 || hit.t > 1){
+      // The geometric intersection doesn't fall on the actual ball-to-skip-target
+      // segment - the same underlying problem as the explicit "unrealistic" cases
+      // above, just caught here instead of by those specific checks. Same fallback.
+      return paintEdgeFallback(ownManPos);
+    }
+    if(hit.u > 1){
+      // The intersection is real and on the skip segment, but it would require
+      // standing beyond his own man - hold near his own man instead, the farthest
+      // out this construction ever allows. Shaded slightly back toward the paint's
+      // center (the same reference line this whole construction already uses) rather
+      // than sitting exactly on his own man's coordinates, so the two tokens stay
+      // visually distinguishable instead of one completely hiding the other.
+      const off = tightCoverageOffset(ownManPos, PAINT_CENTER);
+      return { x: off.x, y: Math.max(off.y, PAINT.yNear) };
+    }
+    if(hit.u < 0){
+      // Symmetric guard on the other end - never pulled past the paint's center
+      // either, back toward or beyond goal.
+      return { x: PAINT_CENTER.x, y: Math.max(PAINT_CENTER.y, PAINT.yNear) };
+    }
+    const result = { x: ballPos.x + hit.t * (secondPos.x - ballPos.x), y: ballPos.y + hit.t * (secondPos.y - ballPos.y) };
+    result.y = Math.max(result.y, PAINT.yNear);
+    return result;
+  }
+
+  // ---------------- on-ball defender geometry ----------------
+  // A straight-line RADIUS from goal (a leash) - confirmed directly: the on-ball
+  // defender stays on a 15-yard leash above GLE and a 7-yard leash below, full
+  // stop, regardless of how wide the ball is. Ignoring width entirely is what
+  // distinguishes this from Box and 1's on-ball defender, who has a real angle
+  // limit on top of his radius cap since a wide shot is genuinely a tougher shot -
+  // Rotation has no such shot-angle concept, so no angle term here at all.
+  const ON_BALL_RADIUS_CAP_FRONT = 15; // above GLE
+  const ON_BALL_RADIUS_CAP_BACK = 7;   // below GLE
+  // A small FIXED separation, not a percentage - guarantees the on-ball defender is
+  // never standing exactly on top of the ball carrier, without the visible shortfall
+  // a proportional shrink causes at typical distances (an earlier version of this
+  // used a 12% proportional reduction, which pulled the defender a yard or more
+  // short of where he should be - obvious once the shot-zone shading gave a visual
+  // reference to compare against).
+  const ON_BALL_MIN_GAP = 0.4;
+  function onBallTarget(ball){
+    const d = h.dist(ball, GOAL);
+    if(d < 0.001) return { x: 0, y: 0 };
+    const cap = ball.y >= 0 ? ON_BALL_RADIUS_CAP_FRONT : ON_BALL_RADIUS_CAP_BACK;
+    const cappedR = Math.min(d, cap);
+    const rc = Math.max(0, cappedR - ON_BALL_MIN_GAP);
+    const scale = rc / d;
+    return { x: ball.x * scale, y: ball.y * scale };
+  }
+
+  // ---------------- help defender geometry ----------------
+  // Whoever's left over after ball + both adjacent defenders are accounted for gets
+  // split between the help defender(s) by which side of the ball they sit on, going
+  // around the goal. This used to run off the same ring buildOffenseRing produces for
+  // the adjacent defenders' skip-line geometry - but that ring deliberately excludes
+  // paint attackers (they don't have a stable ring position the way an outside
+  // attacker does), which meant a paint attacker could never end up in either group
+  // at all, and the dangerous-attacker priority below could never see him. Computed
+  // directly off each attacker's own angle around the goal instead, so it works
+  // identically for outside and paint attackers alike.
+  function helpAssignments(offense, ballIndex, cw1Idx, ccw1Idx){
+    const ballAngle = h.angleAroundGoal(offense[ballIndex]);
+    const cwGroup = [], ccwGroup = [];
+    offense.forEach((a, i) => {
+      if(i === ballIndex || i === cw1Idx || i === ccw1Idx) return;
+      let diff = h.angleAroundGoal(a) - ballAngle;
+      while(diff <= -Math.PI) diff += 2*Math.PI;
+      while(diff > Math.PI) diff -= 2*Math.PI;
+      if(diff >= 0) cwGroup.push(i); else ccwGroup.push(i);
+    });
+    return { cwGroup, ccwGroup };
+  }
+  function clampToInnerBox(pt){
+    return { x: h.clamp(pt.x, -INNER_BOX.xHalf, INNER_BOX.xHalf), y: h.clamp(pt.y, INNER_BOX.yNear, INNER_BOX.yFar) };
+  }
+
+  // Same "off their hip" formula man-to-man's paint rule uses, generalized to take
+  // any reference point to shade toward (man-to-man always shades toward the ball;
+  // the adjacent-defender fallback below shades toward the paint's center instead,
+  // matching its own already-established reference line) - so every place in this
+  // tool that needs "stand right next to X without literally standing on X" produces
+  // the same, consistent-looking gap.
+  const TIGHT_COVERAGE_DIST = 1.1; // yd
+  function tightCoverageOffset(fromPos, towardPos){
+    const d = h.dist(fromPos, towardPos);
+    if(d < 0.05) return { x: fromPos.x, y: fromPos.y };
+    const dir = { x: (towardPos.x-fromPos.x)/d, y: (towardPos.y-fromPos.y)/d };
+    const off = Math.min(TIGHT_COVERAGE_DIST, d*0.45);
+    return { x: fromPos.x + dir.x*off, y: fromPos.y + dir.y*off };
+  }
+
+  // A help defender's group is usually harmless enough that a plain centroid, kept
+  // inside a small safe box in the middle of the paint, is a perfectly good default.
+  // But if one of his assigned attackers is actually standing in the paint - a real,
+  // immediate scoring threat - he abandons that default and fully commits to tightly
+  // covering that attacker instead, the same way man-to-man would, even if it leaves
+  // another (harmless) attacker in his group totally uncovered. If more than one of
+  // his attackers is in the paint at once, he splits the difference between just
+  // those dangerous ones - same idea as Box and 1's inside defender when its paint
+  // has more than one occupant - rather than diluting toward the group's harmless
+  // members too.
+  function helpTarget(offense, ball, indices, fallbackX){
+    if(indices.length === 0) return clampToInnerBox({ x: fallbackX, y: h.paintMidY });
+    const dangerous = indices.filter(i => h.inPaint(offense[i]));
+    if(dangerous.length === 1){
+      return tightCoverageOffset(offense[dangerous[0]], ball);
+    }
+    if(dangerous.length > 1){
+      const sum = dangerous.reduce((s,i) => ({x:s.x+offense[i].x, y:s.y+offense[i].y}), {x:0,y:0});
+      return { x: sum.x/dangerous.length, y: Math.max(sum.y/dangerous.length, PAINT.yNear) };
+    }
+    const sum = indices.reduce((s, i) => ({ x: s.x + offense[i].x, y: s.y + offense[i].y }), { x: 0, y: 0 });
+    return clampToInnerBox({ x: sum.x / indices.length, y: sum.y / indices.length });
+  }
+
+  // ---------------- seat shifting on pass ----------------
+  // A pass is the only thing that moves the wheel. Dragging the current carrier around
+  // never reassigns seats - only a genuine change of ball possession does, and by
+  // exactly as many ring-hops as the ball itself moved (in whichever direction is
+  // shorter), so the defenders' fixed relative order is preserved no matter how far
+  // around the formation the ball jumps.
+  //
+  // The ring used for counting hops always includes the old and new ball carriers
+  // regardless of paint status (both endpoints have to be resolvable), but every OTHER
+  // attacker only counts if they're outside the paint - matching the same "clock
+  // fashion, paint attackers don't count" rule used for RIGHT/LEFT/TWO. Using a
+  // different ring here would let a skip pass shift seats by an amount that doesn't
+  // match what's actually labeled on screen.
+  function buildHopRing(offense, oldBallIndex, newBallIndex){
+    const owners = [oldBallIndex];
+    const points = [offense[oldBallIndex]];
+    offense.forEach((a, i) => {
+      if(i === oldBallIndex) return;
+      if(i === newBallIndex || !h.inPaint(a)){ owners.push(i); points.push(a); }
+    });
+    const order = owners.map((o, idx) => ({ o, a: h.angleAroundGoal(points[idx]) }));
+    order.sort((x, y) => x.a - y.a);
+    return order;
+  }
+  function shiftSeatsForPass(offense, oldBallIndex, newBallIndex){
+    const ring = buildHopRing(offense, oldBallIndex, newBallIndex);
+    const n = ring.length;
+    const oldPos = ring.findIndex(e => e.o === oldBallIndex);
+    const newPos = ring.findIndex(e => e.o === newBallIndex);
+    if(oldPos === -1 || newPos === -1 || n < 2) return;
+    const cwHops = ((newPos - oldPos) % n + n) % n;
+    const ccwHops = ((oldPos - newPos) % n + n) % n;
+    const seatCount = defenderCountForMode();
+
+    // A genuine tie (the new ball carrier is exactly as many clock-hops away in each
+    // direction) only creates real ambiguity in the 5-man version, where the two
+    // "TWO" defenders are distinct seats. Break it by whichever of them is actually
+    // standing closer to the new ball carrier right now, not an arbitrary clockwise
+    // default - that's who realistically slides over to pick him up.
+    if(cwHops === ccwHops && cwHops > 0 && seatCount === 5 && lastSeatPositions.length === 5){
+      const newBallPos = offense[newBallIndex];
+      const cwCandidateSeat  = ((onBallSeat + cwHops) % seatCount + seatCount) % seatCount;
+      const ccwCandidateSeat = ((onBallSeat - cwHops) % seatCount + seatCount) % seatCount;
+      const dCw  = h.dist(lastSeatPositions[cwCandidateSeat],  newBallPos);
+      const dCcw = h.dist(lastSeatPositions[ccwCandidateSeat], newBallPos);
+      onBallSeat = (dCw <= dCcw) ? cwCandidateSeat : ccwCandidateSeat;
+      return;
+    }
+
+    const delta = (cwHops <= ccwHops) ? cwHops : -ccwHops;
+    onBallSeat = ((onBallSeat + delta) % seatCount + seatCount) % seatCount;
+  }
+
+  // ---------------- main computation ----------------
+  function computeRotation(offense, ballIndex){
+    const ball = offense[ballIndex];
+    const seatCount = defenderCountForMode();
+    const cw1SeatIdx  = (onBallSeat + 1) % seatCount;
+    const ccw1SeatIdx = (onBallSeat - 1 + seatCount) % seatCount;
+
+    const cw1Idx  = ringNeighborOffenseIndex(offense, ballIndex, 1);
+    const ccw1Idx = ringNeighborOffenseIndex(offense, ballIndex, -1);
+    const cw2Idx  = ringNeighborOffenseIndex(offense, ballIndex, 2);
+    const ccw2Idx = ringNeighborOffenseIndex(offense, ballIndex, -2);
+
+    const onBallPos  = onBallTarget(ball);
+    const cw1Pos  = cw1Idx  !== null ? adjacentTarget(ball, offense[cw1Idx],  cw2Idx  !== null ? offense[cw2Idx]  : null) : onBallPos;
+    const ccw1Pos = ccw1Idx !== null ? adjacentTarget(ball, offense[ccw1Idx], ccw2Idx !== null ? offense[ccw2Idx] : null) : onBallPos;
+
+    const seatPos  = new Array(seatCount);
+    const seatCall = new Array(seatCount);
+    seatPos[onBallSeat] = onBallPos;  seatCall[onBallSeat] = 'BALL';
+    seatPos[cw1SeatIdx]  = cw1Pos;    seatCall[cw1SeatIdx]  = 'RIGHT';
+    seatPos[ccw1SeatIdx] = ccw1Pos;   seatCall[ccw1SeatIdx] = 'LEFT';
+
+    if(seatCount === 5){
+      const cw2SeatIdx  = (onBallSeat + 2) % seatCount;
+      const ccw2SeatIdx = (onBallSeat - 2 + seatCount) % seatCount;
+      const { cwGroup, ccwGroup } = helpAssignments(offense, ballIndex, cw1Idx, ccw1Idx);
+      seatPos[cw2SeatIdx]  = helpTarget(offense, ball, cwGroup, INNER_BOX.xHalf * 0.5);
+      seatPos[ccw2SeatIdx] = helpTarget(offense, ball, ccwGroup, -INNER_BOX.xHalf * 0.5);
+      seatCall[cw2SeatIdx] = 'TWO';
+      seatCall[ccw2SeatIdx] = 'TWO';
+    } else {
+      // 4-man: only one seat left, and it's equidistant (2 hops) from onBallSeat in
+      // both directions on a 4-seat ring, so there's exactly one remaining seat.
+      const helpSeatIdx = (onBallSeat + 2) % seatCount;
+      const allOther = offense.map((a, i) => i).filter(i => i !== ballIndex && i !== cw1Idx && i !== ccw1Idx);
+      seatPos[helpSeatIdx] = helpTarget(offense, ball, allOther, 0);
+      seatCall[helpSeatIdx] = 'TWO';
+    }
+
+    // Map seats -> tokens -> render entries, keeping color fixed to token identity.
+    const result = [];
+    for(let seat = 0; seat < seatCount; seat++){
+      const token = tokenRing[seat];
+      result[token] = {
+        pos: seatPos[seat],
+        engaged: (seat === onBallSeat || seat === cw1SeatIdx || seat === ccw1SeatIdx),
+        color: ROLE_COLORS[token],
+        call: seatCall[seat]
+      };
+    }
+    lastSeatPositions = seatPos.slice();
+    return result;
+  }
+
+  const engine = DefenseEngine.init({
+    initialOffense: [
+      {x:0,   y:9},
+      {x:-11, y:5},
+      {x:11,  y:5},
+      {x:-7,  y:1.5},
+      {x:7,   y:1.5},
+      {x:3,   y:14}
+    ],
+    initialBallIndex: 0,
+    attackerCount: { adjustable: false }, // fixed 6 offense; it's the defense that's short
+    alwaysSmoothMovement: true, // the whole defense reshapes on every pass - smooth
+                                 // gliding reads much better here than some tokens
+                                 // snapping instantly while others ease into place
+
+    onReset(){
+      resetRotationState();
+    },
+    onPass(newIdx, offense, ballIndex){
+      shiftSeatsForPass(offense, ballIndex, newIdx);
+    },
+    computeDefenders(offense, ballIndex){
+      return computeRotation(offense, ballIndex);
+    },
+
+    // Teaching/debug overlay: shows the actual geometry the defense is reasoning
+    // from, so it's easy to check the rules are being applied correctly by eye.
+    //   - White dashed lines: the skip pass from the ball to every non-adjacent,
+    //     off-ball attacker outside the paint (cw1/ccw1's own men are excluded,
+    //     since those aren't "skip" passes - they're the direct next pass).
+    //   - Gold dashed lines: every off-ball, outside-paint attacker back to the
+    //     center of the paint - the same anchor point the adjacent defenders use
+    //     instead of the goal.
+    drawLanes(laneLayer, defenders, offense, ballIndex){
+      const ball = offense[ballIndex];
+      const cw1Idx = ringNeighborOffenseIndex(offense, ballIndex, 1);
+      const ccw1Idx = ringNeighborOffenseIndex(offense, ballIndex, -1);
+      const ballPx = h.toPx(ball);
+      const centerPx = h.toPx(PAINT_CENTER);
+
+      offense.forEach((a, i) => {
+        if(i === ballIndex || h.inPaint(a)) return;
+        const aPx = h.toPx(a);
+
+        laneLayer.appendChild(h.el('line', {
+          x1: aPx.x, y1: aPx.y, x2: centerPx.x, y2: centerPx.y,
+          stroke: 'rgba(242,193,78,0.45)', 'stroke-width': 1.5, 'stroke-dasharray': '3 4'
+        }));
+
+        if(i !== cw1Idx && i !== ccw1Idx){
+          laneLayer.appendChild(h.el('line', {
+            x1: ballPx.x, y1: ballPx.y, x2: aPx.x, y2: aPx.y,
+            stroke: 'rgba(255,255,255,0.45)', 'stroke-width': 1.5, 'stroke-dasharray': '6 5'
+          }));
+        }
+      });
+    }
+  });
+
+  // ---------------- mode toggle ----------------
+  const mode5Btn = document.getElementById('mode5Btn');
+  const mode4Btn = document.getElementById('mode4Btn');
+  function setMode(newMode){
+    mode = newMode;
+    mode5Btn.classList.toggle('active', mode === '5man');
+    mode4Btn.classList.toggle('active', mode === '4man');
+    // computeDefenders reads `mode` live and the engine already resizes defender
+    // tokens to match whatever length it returns - we just need offense/ball reset
+    // to the initial formation and a fresh render.
+    engine.reset();
+  }
+  mode5Btn.addEventListener('click', () => setMode('5man'));
+  mode4Btn.addEventListener('click', () => setMode('4man'));
+
+  // ---------------- info panel: compact, one bullet at a time ----------------
+  const INFO_SLIDES = [
+    "A man-down defense &mdash; you're short a defender (5-man) or two (4-man), so instead of honest coverage, everyone holds a spot on an imaginary circle around the goal and the whole shape reshapes on <i>every single pass</i>, not just occasionally.",
+    "<b>On-ball defender:</b> plays the ball directly, capped at 15 yards from the goal and 7 yards out below GLE from the goal.",
+    "<b>The adjacent defenders:</b> should be between the off-ball offensive player adjacent to the ball carrier and the goal, while also being in the skip lane to the player 2 passes away from the ball carrier. You are looking to deny the skip pass. They ignore the skip lane assignment only if it's not a real threat: the off-ball offensive player is below GLE, or more than 15 yards above GLE (this is different than 15 yards from the goal).",
+    "<b>TWOs are the defenders farthest from the ball</b> &mdash; two guys in the 5-man version, one in the 4-man &mdash; collapses to the middle to help inside the paint, while splitting up whoever's uncovered outside the paint. On a skip pass the <b>TWO</b> closest to where the ball was thrown will play the ball.",
+    "<b>The wheel:</b> everyone's position relative to each other never changes &mdash; same neighbor to your left and right no matter what. Only the \"who's on ball\" spot spins around that fixed wheel as the ball moves.",
+    "<b>Communication:</b> BALL/RIGHT/LEFT/TWO again, no <b>HOT</b> &mdash; same reasoning as Box and 1, nobody has individual paint responsibility here either and are not sliding from the paint."
+  ];
+  const infoToggle = document.getElementById('infoToggle');
+  const infoPanel = document.getElementById('infoPanel');
+  const infoContent = document.getElementById('infoContent');
+  const infoPrev = document.getElementById('infoPrev');
+  const infoNext = document.getElementById('infoNext');
+  const infoPageIndicator = document.getElementById('infoPageIndicator');
+  let infoIndex = 0;
+
+  function renderInfoSlide(){
+    infoContent.innerHTML = INFO_SLIDES[infoIndex];
+    infoPageIndicator.textContent = (infoIndex + 1) + ' / ' + INFO_SLIDES.length;
+    infoPrev.disabled = infoIndex === 0;
+    infoNext.disabled = infoIndex === INFO_SLIDES.length - 1;
+  }
+  infoPrev.addEventListener('click', () => { if(infoIndex > 0){ infoIndex--; renderInfoSlide(); } });
+  infoNext.addEventListener('click', () => { if(infoIndex < INFO_SLIDES.length - 1){ infoIndex++; renderInfoSlide(); } });
+
+  // Positioned via JS to sit just to the right of the field's ACTUAL rendered box -
+  // not a guess based on layout, the real measured position - and kept outside
+  // field-card in the DOM entirely, so the engine's fit-to-container sizing never
+  // sees it and the field never shrinks when this opens. Clamped so it can't run off
+  // the right edge of the window on a narrower laptop screen.
+  function positionInfoPanel(){
+    const svgRect = document.getElementById('field').getBoundingClientRect();
+    const gap = 16, rightMargin = 8;
+    // Derive the panel's width from whatever space is actually available next to
+    // the field, rather than picking one fixed value that's a compromise on some
+    // window sizes and wasted space on others - clamped to a sensible readable
+    // range (150-260px) so it's never uselessly narrow or absurdly wide.
+    const availableSlack = window.innerWidth - svgRect.right - gap - rightMargin;
+    const panelWidth = Math.max(150, Math.min(260, availableSlack));
+    infoPanel.style.width = panelWidth + 'px';
+    infoPanel.style.left = (svgRect.right + gap) + 'px';
+    // Sits directly below the Communication/About-This-Defense control stack on the
+    // right side, not at the very top of the field, so it never overlaps them.
+    const topOffset = svgRect.top + rightControls.offsetHeight + gap;
+    infoPanel.style.top = topOffset + 'px';
+
+    // Height is fixed to fit the TALLEST bullet at this width, plus a little
+    // breathing room - not matched to the field's (much taller) height. That way
+    // every bullet fits the same box, so paging through never resizes the panel,
+    // without leaving a lot of empty space under the shorter ones either. Has to be
+    // re-measured whenever the width changes, since narrower text wraps into more
+    // lines and needs more height.
+    const savedHTML = infoContent.innerHTML;
+    infoPanel.style.height = 'auto';
+    let tallest = 0;
+    INFO_SLIDES.forEach(slide => {
+      infoContent.innerHTML = slide;
+      tallest = Math.max(tallest, infoPanel.offsetHeight);
+    });
+    infoContent.innerHTML = savedHTML;
+    const maxAvailable = svgRect.top + svgRect.height - topOffset;
+    const finalHeight = Math.min(tallest + 36, maxAvailable);
+    infoPanel.style.height = finalHeight + 'px';
+  }
+
+  // The Shot Zone toggle (left) and the Communication/About-This-Defense stack
+  // (right) are positioned the same way as the info panel - measured against the
+  // field's real box, kept outside field-card's layout entirely, so none of this
+  // ever affects the field's own size. Unlike the info panel these are always
+  // visible, so they're positioned immediately on load, not just when toggled.
+  const leftControls = document.getElementById('leftControls');
+  const rightControls = document.getElementById('rightControls');
+  function positionSideControls(){
+    const svgRect = document.getElementById('field').getBoundingClientRect();
+    const gap = 16, margin = 8;
+
+    // Right stack's width is derived from the same available-slack calculation the
+    // info panel already uses, for the same reason: a fixed width is a compromise
+    // on some window sizes and an overflow risk on others. Without this, "About
+    // This Defense" at double size is wide enough to run off the right edge of the
+    // window on a fairly ordinary laptop width - confirmed by testing, not a
+    // hypothetical. Text wraps onto a second line instead of overflowing.
+    const rightSlack = window.innerWidth - svgRect.right - gap - margin;
+    const rightWidth = Math.max(150, Math.min(260, rightSlack));
+    rightControls.style.width = rightWidth + 'px';
+    rightControls.style.left = (svgRect.right + gap) + 'px';
+    rightControls.style.top = svgRect.top + 'px';
+
+    const leftWidth = leftControls.offsetWidth;
+    leftControls.style.left = Math.max(margin, svgRect.left - leftWidth - gap) + 'px';
+    leftControls.style.top = svgRect.top + 'px';
+  }
+
+  infoToggle.addEventListener('click', () => {
+    infoPanel.classList.toggle('open');
+    if(infoPanel.classList.contains('open')){
+      infoIndex = 0;
+      renderInfoSlide();
+      positionInfoPanel();
+    }
+  });
+  window.addEventListener('resize', () => {
+    positionSideControls();
+    if(infoPanel.classList.contains('open')) positionInfoPanel();
+  });
+  positionSideControls();
+})();
+</script>
+</body>
+</html>

@@ -15,16 +15,27 @@
       <span class="scheme-label">Box and 1</span>
       <span></span>
     </div>
-    <div class="toolbar-row">
-      <label class="comm-toggle">
-        <input type="checkbox" id="commToggle">
-        Communication
-      </label>
-    </div>
     <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
-    <p class="hint">Drag any dot to move it. Click (don't drag) an orange dot to give it the ball. Carry the ball around behind the goal and up into the bottom zone to trigger the rotation, or pass to the opposite low man from within 1 yard of GLE to beat the slide.</p>
-    <div class="minimal-controls">
-      <button class="ctl" id="resetBtn">Reset Defense</button>
+  </div>
+  <div class="side-controls side-controls-left" id="leftControls">
+    <label class="comm-toggle">
+      <input type="checkbox" id="shotZoneToggle">
+      <span>Shot Zone</span>
+    </label>
+  </div>
+  <div class="side-controls side-controls-right" id="rightControls">
+    <label class="comm-toggle">
+      <input type="checkbox" id="commToggle">
+      <span>Communication</span>
+    </label>
+    <button class="ctl info-toggle" id="infoToggle">&#9432; About This Defense</button>
+  </div>
+  <div class="info-panel" id="infoPanel">
+    <div class="info-content" id="infoContent"></div>
+    <div class="info-nav">
+      <button id="infoPrev" aria-label="Previous">&larr; Back</button>
+      <span class="info-page-indicator" id="infoPageIndicator">1 / 1</span>
+      <button id="infoNext" aria-label="Next">Next &rarr;</button>
     </div>
   </div>
 </div>
@@ -39,13 +50,22 @@
   // The "fan": 15 yd from goal, +/-60 deg off dead-center.
   const FAN_R = 15;
   const FAN_HALF_ANGLE = Math.PI/3; // 60 deg
+  // A small FIXED separation, not a percentage - guarantees the on-ball defender is
+  // never standing exactly on top of the ball carrier, without the visible shortfall
+  // a proportional shrink causes at typical fan distances (an earlier version of
+  // this used a 12% proportional reduction, which pulled the defender a yard or more
+  // short of the true fan edge - obvious once the shot-zone shading gave a visual
+  // reference to compare against). At 0.4 yd this barely reads at 10-15 yards out,
+  // where it matters most, while still keeping the dots visibly separate up close.
+  const ON_BALL_MIN_GAP = 0.4;
   function fanClamp(pt){
     const dx = pt.x-GOAL.x, dy = pt.y-GOAL.y;
     const r = Math.hypot(dx,dy);
     if(r < 0.0001) return {x:GOAL.x, y:GOAL.y};
     let angle = Math.atan2(dx, dy);
     angle = h.clamp(angle, -FAN_HALF_ANGLE, FAN_HALF_ANGLE);
-    const rc = Math.min(r, FAN_R);
+    const cappedR = Math.min(r, FAN_R);
+    const rc = Math.max(0, cappedR - ON_BALL_MIN_GAP);
     return { x: GOAL.x + rc*Math.sin(angle), y: GOAL.y + rc*Math.cos(angle) };
   }
 
@@ -452,6 +472,113 @@
       return computeBoxAndOne(offense, ballIndex);
     }
   });
+
+  // ---------------- info panel: compact, one bullet at a time ----------------
+  const INFO_SLIDES = [
+    "Four defenders anchor the corners of the paint like a box; a fifth floats inside to help. The corner four guard <i>spots</i>, not men &mdash; it's a zone.",
+    "<b>Corners of the box:</b> if the ball is in your quadrant, step out to challenge the ball &mdash; not further than a 15 yard shot, and not to a spot where the goal appears less than 2 feet wide to the shooter. The defender diagonally across from the on-ball defender (opposite corner) pinches inward toward the middle of the paint to help, since that's the furthest-away, least-urgent spot right now.",
+    "<b>The inside defender:</b> collapses to help on whoever's in the paint, splitting attention if there's more than one. If the ball itself comes into the lane top center above the paint, he steps up and takes the ball carrier directly.",
+    "<b>The rotation:</b> if the ball carrier wraps behind the goal and gets picked up by the slide &mdash; or skips the pass to the far low man before that happens &mdash; the whole box rotates one corner over. That's permanent, not temporary, and it keeps chaining every time it happens again.",
+    "<b>Communication:</b> same BALL/RIGHT/LEFT/TWO idea as man-to-man, but no <b>HOT</b> &mdash; because we are not sliding from the paint the way man-to-man does. The inside defender stays silent unless he's the one directly on the ball."
+  ];
+  const infoToggle = document.getElementById('infoToggle');
+  const infoPanel = document.getElementById('infoPanel');
+  const infoContent = document.getElementById('infoContent');
+  const infoPrev = document.getElementById('infoPrev');
+  const infoNext = document.getElementById('infoNext');
+  const infoPageIndicator = document.getElementById('infoPageIndicator');
+  let infoIndex = 0;
+
+  function renderInfoSlide(){
+    infoContent.innerHTML = INFO_SLIDES[infoIndex];
+    infoPageIndicator.textContent = (infoIndex + 1) + ' / ' + INFO_SLIDES.length;
+    infoPrev.disabled = infoIndex === 0;
+    infoNext.disabled = infoIndex === INFO_SLIDES.length - 1;
+  }
+  infoPrev.addEventListener('click', () => { if(infoIndex > 0){ infoIndex--; renderInfoSlide(); } });
+  infoNext.addEventListener('click', () => { if(infoIndex < INFO_SLIDES.length - 1){ infoIndex++; renderInfoSlide(); } });
+
+  // Positioned via JS to sit just to the right of the field's ACTUAL rendered box -
+  // not a guess based on layout, the real measured position - and kept outside
+  // field-card in the DOM entirely, so the engine's fit-to-container sizing never
+  // sees it and the field never shrinks when this opens. Clamped so it can't run off
+  // the right edge of the window on a narrower laptop screen.
+  function positionInfoPanel(){
+    const svgRect = document.getElementById('field').getBoundingClientRect();
+    const gap = 16, rightMargin = 8;
+    // Derive the panel's width from whatever space is actually available next to
+    // the field, rather than picking one fixed value that's a compromise on some
+    // window sizes and wasted space on others - clamped to a sensible readable
+    // range (150-260px) so it's never uselessly narrow or absurdly wide.
+    const availableSlack = window.innerWidth - svgRect.right - gap - rightMargin;
+    const panelWidth = Math.max(150, Math.min(260, availableSlack));
+    infoPanel.style.width = panelWidth + 'px';
+    infoPanel.style.left = (svgRect.right + gap) + 'px';
+    // Sits directly below the Communication/About-This-Defense control stack on the
+    // right side, not at the very top of the field, so it never overlaps them.
+    const topOffset = svgRect.top + rightControls.offsetHeight + gap;
+    infoPanel.style.top = topOffset + 'px';
+
+    // Height is fixed to fit the TALLEST bullet at this width, plus a little
+    // breathing room - not matched to the field's (much taller) height. That way
+    // every bullet fits the same box, so paging through never resizes the panel,
+    // without leaving a lot of empty space under the shorter ones either. Has to be
+    // re-measured whenever the width changes, since narrower text wraps into more
+    // lines and needs more height.
+    const savedHTML = infoContent.innerHTML;
+    infoPanel.style.height = 'auto';
+    let tallest = 0;
+    INFO_SLIDES.forEach(slide => {
+      infoContent.innerHTML = slide;
+      tallest = Math.max(tallest, infoPanel.offsetHeight);
+    });
+    infoContent.innerHTML = savedHTML;
+    const maxAvailable = svgRect.top + svgRect.height - topOffset;
+    const finalHeight = Math.min(tallest + 36, maxAvailable);
+    infoPanel.style.height = finalHeight + 'px';
+  }
+
+  // The Shot Zone toggle (left) and the Communication/About-This-Defense stack
+  // (right) are positioned the same way as the info panel - measured against the
+  // field's real box, kept outside field-card's layout entirely, so none of this
+  // ever affects the field's own size. Unlike the info panel these are always
+  // visible, so they're positioned immediately on load, not just when toggled.
+  const leftControls = document.getElementById('leftControls');
+  const rightControls = document.getElementById('rightControls');
+  function positionSideControls(){
+    const svgRect = document.getElementById('field').getBoundingClientRect();
+    const gap = 16, margin = 8;
+
+    // Right stack's width is derived from the same available-slack calculation the
+    // info panel already uses, for the same reason: a fixed width is a compromise
+    // on some window sizes and an overflow risk on others. Without this, "About
+    // This Defense" at double size is wide enough to run off the right edge of the
+    // window on a fairly ordinary laptop width - confirmed by testing, not a
+    // hypothetical. Text wraps onto a second line instead of overflowing.
+    const rightSlack = window.innerWidth - svgRect.right - gap - margin;
+    const rightWidth = Math.max(150, Math.min(260, rightSlack));
+    rightControls.style.width = rightWidth + 'px';
+    rightControls.style.left = (svgRect.right + gap) + 'px';
+    rightControls.style.top = svgRect.top + 'px';
+
+    const leftWidth = leftControls.offsetWidth;
+    leftControls.style.left = Math.max(margin, svgRect.left - leftWidth - gap) + 'px';
+    leftControls.style.top = svgRect.top + 'px';
+  }
+
+  infoToggle.addEventListener('click', () => {
+    infoPanel.classList.toggle('open');
+    if(infoPanel.classList.contains('open')){
+      infoIndex = 0;
+      renderInfoSlide();
+      positionInfoPanel();
+    }
+  });
+  window.addEventListener('resize', () => {
+    positionSideControls();
+    if(infoPanel.classList.contains('open')) positionInfoPanel();
+  });
+  positionSideControls();
 })();
 </script>
 </body>

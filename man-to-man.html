@@ -12,23 +12,37 @@
   <div class="field-card">
     <div class="field-title-row">
       <a href="index.html" class="back-link">&larr; All Defenses</a>
-      <span class="scheme-label">Man to Man</span>
-      <span class="status attacker-counter">
-        <button class="ctl round" id="addBtn" aria-label="Add attacker">+</button>
-        Attackers: <b id="countLabel">4</b>
-        <button class="ctl round" id="removeBtn" aria-label="Remove attacker">&minus;</button>
+      <span class="scheme-label-stack">
+        <span class="scheme-label">Man to Man</span>
+        <span class="attacker-counter">
+          <button class="ctl round" id="addBtn" aria-label="Add attacker">+</button>
+          Attackers: <b id="countLabel">4</b>
+          <button class="ctl round" id="removeBtn" aria-label="Remove attacker">&minus;</button>
+        </span>
       </span>
-    </div>
-    <div class="toolbar-row">
-      <label class="comm-toggle">
-        <input type="checkbox" id="commToggle">
-        Communication
-      </label>
+      <span></span>
     </div>
     <svg id="field" viewBox="0 0 880 760" xmlns="http://www.w3.org/2000/svg"></svg>
-    <p class="hint">Drag any dot to move it. Click (don't drag) an orange dot to give it the ball.</p>
-    <div class="minimal-controls">
-      <button class="ctl" id="resetBtn">Reset Positions</button>
+  </div>
+  <div class="side-controls side-controls-left" id="leftControls">
+    <label class="comm-toggle">
+      <input type="checkbox" id="shotZoneToggle">
+      <span>Shot Zone</span>
+    </label>
+  </div>
+  <div class="side-controls side-controls-right" id="rightControls">
+    <label class="comm-toggle">
+      <input type="checkbox" id="commToggle">
+      <span>Communication</span>
+    </label>
+    <button class="ctl info-toggle" id="infoToggle">&#9432; About This Defense</button>
+  </div>
+  <div class="info-panel" id="infoPanel">
+    <div class="info-content" id="infoContent"></div>
+    <div class="info-nav">
+      <button id="infoPrev" aria-label="Previous">&larr; Back</button>
+      <span class="info-page-indicator" id="infoPageIndicator">1 / 1</span>
+      <button id="infoNext" aria-label="Next">Next &rarr;</button>
     </div>
   </div>
 </div>
@@ -43,6 +57,13 @@
   const MIN_SAG = 0.12;
   const MAX_SAG = 0.72;
   const FAR_THRESHOLD = 20; // yd from ball -> collapse to the inner box instead of the paint edge
+
+  // Fixed per-defender colors, same principle as Box and 1 and Rotation: each
+  // defender keeps a consistent, distinct color so a player's eye can track a
+  // specific defender as the offense gets dragged around, rather than every
+  // defender being the same blue. Index-aligned with offense/attacker count
+  // (2-6), since man-to-man assigns defender i to attacker i directly.
+  const DEFENDER_COLORS = ['#8e44ad', '#2980b9', '#e91e8c', '#16a085', '#f1c40f', '#95a5a6'];
 
   function computeManDefender(attacker, ball, isOnBall){
     let target;
@@ -136,7 +157,7 @@
         else if(h.inPaint(a)) call = (i === hotIdx) ? 'HOT' : 'TWO';
         else call = 'TWO';
 
-        return { pos: positions[i], engaged: i === ballIndex, call };
+        return { pos: positions[i], engaged: i === ballIndex, call, color: DEFENDER_COLORS[i] };
       });
     },
 
@@ -151,6 +172,113 @@
       });
     }
   });
+
+  // ---------------- info panel: compact, one bullet at a time ----------------
+  const INFO_SLIDES = [
+    "Every defender guards one specific attacker, wherever he goes.",
+    "<b>Positioning:</b> play \"ball-you-goal\" &mdash; stay on the line between your man and the goal, sagging closer to the goal as the ball gets farther from your man.",
+    "<b>If your man's in the paint:</b> play him tight, right on his hip, in the passing lane &mdash; don't sag off him just because the ball is elsewhere.",
+    "<b>If your man's off-ball and outside the paint:</b> sag off him toward the middle to help protect the paint.",
+    "<b>Communication:</b> on-ball defender calls <b>BALL</b>. His two adjacent neighbors around the clock call <b>RIGHT</b> and <b>LEFT</b>. If an off-ball defender's man is in the paint, he will call <b>HOT</b> if he is closest to the ball and <b>TWO</b> if he is not. Everyone else who is not adjacent or covering a man in the paint will call <b>TWO</b>."
+  ];
+  const infoToggle = document.getElementById('infoToggle');
+  const infoPanel = document.getElementById('infoPanel');
+  const infoContent = document.getElementById('infoContent');
+  const infoPrev = document.getElementById('infoPrev');
+  const infoNext = document.getElementById('infoNext');
+  const infoPageIndicator = document.getElementById('infoPageIndicator');
+  let infoIndex = 0;
+
+  function renderInfoSlide(){
+    infoContent.innerHTML = INFO_SLIDES[infoIndex];
+    infoPageIndicator.textContent = (infoIndex + 1) + ' / ' + INFO_SLIDES.length;
+    infoPrev.disabled = infoIndex === 0;
+    infoNext.disabled = infoIndex === INFO_SLIDES.length - 1;
+  }
+  infoPrev.addEventListener('click', () => { if(infoIndex > 0){ infoIndex--; renderInfoSlide(); } });
+  infoNext.addEventListener('click', () => { if(infoIndex < INFO_SLIDES.length - 1){ infoIndex++; renderInfoSlide(); } });
+
+  // Positioned via JS to sit just to the right of the field's ACTUAL rendered box -
+  // not a guess based on layout, the real measured position - and kept outside
+  // field-card in the DOM entirely, so the engine's fit-to-container sizing never
+  // sees it and the field never shrinks when this opens. Clamped so it can't run off
+  // the right edge of the window on a narrower laptop screen.
+  function positionInfoPanel(){
+    const svgRect = document.getElementById('field').getBoundingClientRect();
+    const gap = 16, rightMargin = 8;
+    // Derive the panel's width from whatever space is actually available next to
+    // the field, rather than picking one fixed value that's a compromise on some
+    // window sizes and wasted space on others - clamped to a sensible readable
+    // range (150-260px) so it's never uselessly narrow or absurdly wide.
+    const availableSlack = window.innerWidth - svgRect.right - gap - rightMargin;
+    const panelWidth = Math.max(150, Math.min(260, availableSlack));
+    infoPanel.style.width = panelWidth + 'px';
+    infoPanel.style.left = (svgRect.right + gap) + 'px';
+    // Sits directly below the Communication/About-This-Defense control stack on the
+    // right side, not at the very top of the field, so it never overlaps them.
+    const topOffset = svgRect.top + rightControls.offsetHeight + gap;
+    infoPanel.style.top = topOffset + 'px';
+
+    // Height is fixed to fit the TALLEST bullet at this width, plus a little
+    // breathing room - not matched to the field's (much taller) height. That way
+    // every bullet fits the same box, so paging through never resizes the panel,
+    // without leaving a lot of empty space under the shorter ones either. Has to be
+    // re-measured whenever the width changes, since narrower text wraps into more
+    // lines and needs more height.
+    const savedHTML = infoContent.innerHTML;
+    infoPanel.style.height = 'auto';
+    let tallest = 0;
+    INFO_SLIDES.forEach(slide => {
+      infoContent.innerHTML = slide;
+      tallest = Math.max(tallest, infoPanel.offsetHeight);
+    });
+    infoContent.innerHTML = savedHTML;
+    const maxAvailable = svgRect.top + svgRect.height - topOffset;
+    const finalHeight = Math.min(tallest + 36, maxAvailable);
+    infoPanel.style.height = finalHeight + 'px';
+  }
+
+  // The Shot Zone toggle (left) and the Communication/About-This-Defense stack
+  // (right) are positioned the same way as the info panel - measured against the
+  // field's real box, kept outside field-card's layout entirely, so none of this
+  // ever affects the field's own size. Unlike the info panel these are always
+  // visible, so they're positioned immediately on load, not just when toggled.
+  const leftControls = document.getElementById('leftControls');
+  const rightControls = document.getElementById('rightControls');
+  function positionSideControls(){
+    const svgRect = document.getElementById('field').getBoundingClientRect();
+    const gap = 16, margin = 8;
+
+    // Right stack's width is derived from the same available-slack calculation the
+    // info panel already uses, for the same reason: a fixed width is a compromise
+    // on some window sizes and an overflow risk on others. Without this, "About
+    // This Defense" at double size is wide enough to run off the right edge of the
+    // window on a fairly ordinary laptop width - confirmed by testing, not a
+    // hypothetical. Text wraps onto a second line instead of overflowing.
+    const rightSlack = window.innerWidth - svgRect.right - gap - margin;
+    const rightWidth = Math.max(150, Math.min(260, rightSlack));
+    rightControls.style.width = rightWidth + 'px';
+    rightControls.style.left = (svgRect.right + gap) + 'px';
+    rightControls.style.top = svgRect.top + 'px';
+
+    const leftWidth = leftControls.offsetWidth;
+    leftControls.style.left = Math.max(margin, svgRect.left - leftWidth - gap) + 'px';
+    leftControls.style.top = svgRect.top + 'px';
+  }
+
+  infoToggle.addEventListener('click', () => {
+    infoPanel.classList.toggle('open');
+    if(infoPanel.classList.contains('open')){
+      infoIndex = 0;
+      renderInfoSlide();
+      positionInfoPanel();
+    }
+  });
+  window.addEventListener('resize', () => {
+    positionSideControls();
+    if(infoPanel.classList.contains('open')) positionInfoPanel();
+  });
+  positionSideControls();
 })();
 </script>
 </body>
